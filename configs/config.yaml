@@ -1,0 +1,69 @@
+# configs/config.yaml
+
+# ===============================
+# Model Configuration
+# ===============================
+model:
+  window_size: 30
+  feature_names:
+    - s2
+    - s3
+    - s4
+    - s7
+    - s8
+    - s9
+    - s11
+    - s12
+    - s13
+    - s14
+    - s15
+    - s17
+    - s20
+    - s21
+  input_shape: [30, 14]
+  architecture: "light_classifier"
+  random_state: 42
+  light_classifier:
+    n_estimators: 100
+    max_depth: 10
+    class_weight: "balanced"
+
+# ===============================
+# Training Configuration
+# ===============================
+training:
+  train_fraction: 0.2
+  validation_split: 0.2
+  test_split: 0.1
+  random_state: 42
+
+# ===============================
+# Human-in-the-Loop Configuration
+# ===============================
+hitl:
+  enabled: true
+  uncertain_low: 0.4
+  uncertain_high: 0.6
+  max_cases: 200
+  sample_per_bucket: 300
+
+# ===============================
+# Path Configuration
+# ===============================
+paths:
+  data_file: 'data/raw/CMAPSS/FD001_processed.parquet'
+  test_file: 'data/raw/CMAPSS/test_FD001.txt'
+  rul_file: 'data/raw/CMAPSS/RUL_FD001.txt'
+  results_dir: 'results'
+  plot_config_path: 'plot_config.yaml'
+  reasoning_rules_path: 'src/reasoning/rules.pl'
+
+# ===============================
+# Symbolic Reasoning Configuration
+# ===============================
+symbolic_reasoning:
+  enabled: true
+  extraction_threshold: 0.6
+  min_confidence: 0.7
+  max_rules: 100
+  pruning_strategy: 'confidence'

@@ -1,0 +1,27 @@
+# Logs and generated artifacts
+logs/
+results/
+*.sh
+*.txt
+!requirements.txt
+
+# Local checks and IDE files
+check_data.py
+.idea/
+.vscode/
+.venv/
+venv/
+*.pyc
+__pycache__/
+.pytest_cache/
+.coverage
+*.egg-info/
+
+# Manuscript and local notes
+Results_for_Manuscript.md
+paper.pdf
+rule_extraction_sample.log
+configs/plot_config.yaml
+
+# Local C-MAPSS downloads
+data/raw/
