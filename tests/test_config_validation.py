@@ -44,6 +44,53 @@ class TestConfigValidation(unittest.TestCase):
             self.assertEqual(config['paths']['rul_file'], '')
             self.assertTrue(os.path.isdir(config['paths']['results_dir']))
 
+    def _minimal_config(self):
+        return {
+            'model': {
+                'window_size': 3,
+                'feature_names': ['a', 'b'],
+                'input_shape': [3, 2],
+                'architecture': 'random_forest',
+            },
+            'training': {'validation_split': 0.2, 'test_split': 0.1,
+                         'train_fraction': 0.2},
+            'paths': {},
+        }
+
+    def test_rejects_inconsistent_input_shape(self):
+        config = self._minimal_config()
+        config['model']['input_shape'] = [3, 1]
+        with self.assertRaises(ValueError):
+            validate_config(config, self.logger, '/tmp/project', '/tmp/project/configs')
+
+    def test_rejects_duplicate_features_and_bad_architecture(self):
+        config = self._minimal_config()
+        config['model']['feature_names'] = ['a', 'a']
+        with self.assertRaises(ValueError):
+            validate_config(config, self.logger, '/tmp/project', '/tmp/project/configs')
+
+        config = self._minimal_config()
+        config['model']['architecture'] = 'transformer'
+        with self.assertRaises(ValueError):
+            validate_config(config, self.logger, '/tmp/project', '/tmp/project/configs')
+
+    def test_rejects_invalid_calibration_and_threshold(self):
+        config = self._minimal_config()
+        config['calibration'] = {'enabled': True, 'method': 'platt'}
+        with self.assertRaises(ValueError):
+            validate_config(config, self.logger, '/tmp/project', '/tmp/project/configs')
+
+        config = self._minimal_config()
+        config['thresholding'] = {'strategy': 'fbeta', 'beta': 0.0}
+        with self.assertRaises(ValueError):
+            validate_config(config, self.logger, '/tmp/project', '/tmp/project/configs')
+
+    def test_rejects_invalid_non_finite_policy(self):
+        config = self._minimal_config()
+        config['preprocessing'] = {'non_finite_policy': 'ignore'}
+        with self.assertRaises(ValueError):
+            validate_config(config, self.logger, '/tmp/project', '/tmp/project/configs')
+
     def test_validate_config_missing_key(self):
         config = {
             'model': {},

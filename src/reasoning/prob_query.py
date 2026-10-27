@@ -4,6 +4,7 @@
 import json
 import logging
 import os
+import re
 import sys
 
 from problog import get_evaluatable
@@ -69,16 +70,56 @@ def _probability(result, name):
     return 0.0
 
 
-def evaluate_state(base_program, sensor_values):
-    """Append evidence for one state and evaluate failure-risk queries."""
+def _normalise_learned_rules(learned_rules):
+    """Accept rule names or metadata dictionaries and return unique names."""
+    names = []
+    for item in learned_rules or []:
+        if isinstance(item, dict):
+            name = item.get('rule') or item.get('name')
+        else:
+            name = item
+        if not name:
+            continue
+        name = str(name)
+        if name not in names:
+            names.append(name)
+    return names
+
+
+def evaluate_state(base_program, sensor_values, learned_rules=None,
+                   learned_rule_weight=0.15, max_active_learned_rules=3):
+    """Append evidence for one state and evaluate failure-risk queries.
+
+    Active learned HITL rules are injected as independent probabilistic facts
+    with a capped weight. If ``w`` is the weight and ``n`` active rules are
+    retained, their combined contribution is the noisy-or
+    ``1 - (1 - w)**n``. A single rule therefore cannot dominate the final risk,
+    and ``max_active_learned_rules`` bounds the total contribution.
+    """
     conditions = extract_conditions(sensor_values)
     evidence = [name for name, active in conditions.items() if active]
     program = base_program + '\n' + ''.join(f'{name}.\n' for name in evidence)
+
+    weight = float(learned_rule_weight)
+    if not 0.0 <= weight <= 1.0:
+        raise ValueError("learned_rule_weight must be in [0, 1].")
+    max_active = max(0, int(max_active_learned_rules))
+    active_learned = _normalise_learned_rules(learned_rules)[:max_active]
+
+    for index, rule_name in enumerate(active_learned):
+        safe_name = re.sub(r'[^a-zA-Z0-9_]', '_', rule_name)
+        evidence_name = f"learned_evidence_{index}_{safe_name}"
+        program += f"\n{weight:.6f}::{evidence_name}.\n"
+        program += f"failure_risk :- {evidence_name}.\n"
+
     result = get_evaluatable().create_from(PrologString(program)).evaluate()
     return {
         'failure_risk': _probability(result, 'failure_risk'),
         'hpc_degradation': _probability(result, 'hpc_degradation'),
         'active_conditions': evidence,
+        'learned_rules_active': active_learned,
+        'learned_rule_weight': weight,
+        'learned_rules_cap': max_active,
     }
 
 

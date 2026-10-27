@@ -37,6 +37,7 @@ class ANSRDTCore:
         self.scaler = self._load_scaler()
 
         self.reasoner = self._initialize_reasoner()
+        self.last_data_quality: Dict[str, Any] = {}
 
         self.current_state: Optional[Dict[str, Any]] = None
         self.state_history_limit = self.config.get('logging', {}).get('state_history_limit', 1000)
@@ -87,12 +88,24 @@ class ANSRDTCore:
         if not os.path.exists(rules_path):
             raise FileNotFoundError(f"Rules file not found at: {rules_path}")
 
-        return SymbolicReasoner(
+        reasoner = SymbolicReasoner(
             rules_path=rules_path,
             input_shape=(self.window_size, len(self.feature_names)),
             model=self.classifier,
             logger=self.logger,
         )
+        temporal_path = os.path.join(self.results_dir, 'temporal_thresholds.json')
+        if os.path.exists(temporal_path):
+            try:
+                with open(temporal_path) as file:
+                    reasoner.set_temporal_thresholds(json.load(file))
+                self.logger.info("Loaded temporal thresholds from %s", temporal_path)
+            except (OSError, ValueError, TypeError) as error:
+                self.logger.warning(
+                    "Could not load temporal thresholds from %s: %s",
+                    temporal_path, error,
+                )
+        return reasoner
 
     def preprocess_data(self, sensor_data: np.ndarray) -> np.ndarray:
         """Validate and reshape input to ``(batch, window_size, features)``."""
@@ -116,8 +129,28 @@ class ANSRDTCore:
                 f"Expected inner shape {expected_inner}, got {sensor_data.shape[1:]}"
             )
 
-        if np.isnan(sensor_data).any() or np.isinf(sensor_data).any():
-            self.logger.warning("NaN or Inf detected in input; replacing with zeros.")
+        non_finite = ~np.isfinite(sensor_data)
+        non_finite_count = int(non_finite.sum())
+        self.last_data_quality = {
+            'non_finite_inputs': non_finite_count,
+            'total_values': int(sensor_data.size),
+            'policy': self.config.get('preprocessing', {}).get(
+                'non_finite_policy', 'zero'
+            ),
+        }
+        if non_finite_count:
+            policy = self.last_data_quality['policy']
+            if policy == 'error':
+                raise ValueError(
+                    f"Input contains {non_finite_count} NaN/Inf value(s) and "
+                    "preprocessing.non_finite_policy is 'error'."
+                )
+            if policy not in {'zero', 'replace_zero'}:
+                raise ValueError(f"Unsupported non-finite policy: {policy!r}")
+            self.logger.warning(
+                "Replacing %d NaN/Inf input value(s) with zeros.",
+                non_finite_count,
+            )
             sensor_data = np.nan_to_num(sensor_data, nan=0.0, posinf=0.0, neginf=0.0)
         return sensor_data
 
@@ -142,7 +175,9 @@ class ANSRDTCore:
         rule_activations = []
         if self.reasoner:
             try:
-                insights = self.reasoner.reason(current_readings)
+                insights = self.reasoner.reason(
+                    current_readings, window=raw_data[0]
+                )
                 history = self.reasoner.get_rule_activations()
                 if history:
                     rule_activations = history[-1].get('activated_rules_detailed', [])
@@ -155,6 +190,7 @@ class ANSRDTCore:
             'anomaly_score': failure_probability,
             'anomaly_detected': anomaly_detected,
             'sensor_readings': current_readings,
+            'input_quality': dict(self.last_data_quality),
             'insights': insights,
             'rule_activations': rule_activations,
             'timestamp': str(np.datetime64('now')),

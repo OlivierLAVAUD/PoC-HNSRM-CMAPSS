@@ -45,6 +45,8 @@ class CMAPSSLoader:
         self.logger = logger or logging.getLogger(__name__)
         self.unit_ids: Optional[np.ndarray] = None
         self.window_end_cycles: Optional[np.ndarray] = None
+        self.window_rul: Optional[np.ndarray] = None
+        self.last_split_masks: Optional[dict] = None
 
     def _read_frame(self, path: str) -> pd.DataFrame:
         """Read a processed parquet or a raw NASA whitespace text file."""
@@ -88,9 +90,10 @@ class CMAPSSLoader:
         return frame
 
     def _window_frame(self, frame: pd.DataFrame) -> Tuple[np.ndarray, np.ndarray,
-                                                          np.ndarray, np.ndarray]:
-        """Create per-unit sliding windows, labels, unit ids and end cycles."""
-        X_list, y_list, unit_list, cycle_list = [], [], [], []
+                                                          np.ndarray, np.ndarray,
+                                                          np.ndarray]:
+        """Create per-unit sliding windows, labels, unit ids, cycles and RUL."""
+        X_list, y_list, unit_list, cycle_list, rul_list = [], [], [], [], []
         for unit, group in frame.groupby('unit_number', sort=True):
             values = group[self.feature_names].to_numpy(dtype=np.float32)
             rul = group['rul'].to_numpy(dtype=np.int64)
@@ -104,6 +107,7 @@ class CMAPSSLoader:
                 y_list.append(1 if rul[end - 1] <= self.rul_threshold else 0)
                 unit_list.append(unit)
                 cycle_list.append(int(cycles[end - 1]))
+                rul_list.append(int(rul[end - 1]))
 
         if not X_list:
             raise ValueError(
@@ -112,14 +116,54 @@ class CMAPSSLoader:
         return (np.asarray(X_list, dtype=np.float32),
                 np.asarray(y_list, dtype=np.int64),
                 np.asarray(unit_list),
+                np.asarray(cycle_list, dtype=np.int64),
+                np.asarray(rul_list, dtype=np.int64))
+
+    def _window_unlabeled_frame(
+            self, frame: pd.DataFrame
+    ) -> Tuple[np.ndarray, np.ndarray, np.ndarray]:
+        """Create windows for inference where true RUL labels are unavailable."""
+        X_list, unit_list, cycle_list = [], [], []
+        for unit, group in frame.groupby('unit_number', sort=True):
+            values = group[self.feature_names].to_numpy(dtype=np.float32)
+            cycles = group['cycle'].to_numpy(dtype=np.int64)
+            if len(values) < self.window_size:
+                self.logger.debug("Skipping unit %s with %d cycles", unit, len(values))
+                continue
+            for start in range(0, len(values) - self.window_size + 1, self.stride):
+                end = start + self.window_size
+                X_list.append(values[start:end])
+                unit_list.append(unit)
+                cycle_list.append(int(cycles[end - 1]))
+
+        if not X_list:
+            raise ValueError(
+                f"No windows produced: window_size={self.window_size} exceeds trajectory lengths"
+            )
+        return (np.asarray(X_list, dtype=np.float32),
+                np.asarray(unit_list),
                 np.asarray(cycle_list, dtype=np.int64))
+
+    def load_unlabeled_data(self) -> np.ndarray:
+        """Load inference windows without requiring true RUL labels."""
+        frame = self._read_frame(self.data_file)
+        X, units, cycles = self._window_unlabeled_frame(frame)
+        self.unit_ids = units
+        self.window_end_cycles = cycles
+        self.window_rul = None
+        self.logger.info(
+            "Loaded %d unlabeled inference windows from %d units",
+            len(X), len(np.unique(units)),
+        )
+        return X
 
     def load_data(self) -> Tuple[np.ndarray, np.ndarray]:
         """Load training windows as ``X (samples, window_size, features)`` and ``y``."""
         frame = self._read_frame(self.data_file)
-        X, y, units, cycles = self._window_frame(frame)
+        X, y, units, cycles, rul = self._window_frame(frame)
         self.unit_ids = units
         self.window_end_cycles = cycles
+        self.window_rul = rul
         self.logger.info(
             "Loaded %d training windows from %d units (%d positive)",
             len(X), len(np.unique(units)), int(y.sum()),
@@ -131,9 +175,10 @@ class CMAPSSLoader:
         if not self.test_file:
             raise ValueError("test_file was not provided to CMAPSSLoader")
         frame = self._read_test_frame(self.test_file)
-        X, y, units, cycles = self._window_frame(frame)
+        X, y, units, cycles, rul = self._window_frame(frame)
         self.unit_ids = units
         self.window_end_cycles = cycles
+        self.window_rul = rul
         self.logger.info("Loaded %d test windows from %d units", len(X), len(np.unique(units)))
         return X, y
 
@@ -189,6 +234,7 @@ class CMAPSSLoader:
             'val': np.isin(self.unit_ids, list(val_units)),
             'test': np.isin(self.unit_ids, list(test_units)),
         }
+        self.last_split_masks = masks
         self.logger.info(
             "Unit split: train=%d val=%d test=%d units",
             len(train_units), len(val_units), len(test_units),

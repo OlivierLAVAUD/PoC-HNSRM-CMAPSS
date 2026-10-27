@@ -7,6 +7,7 @@ import numpy as np
 from typing import Dict, List, Any, Tuple, Optional
 from .rule_learning import RuleLearner
 from .state_tracker import StateTracker
+from .temporal import window_temporal_features
 from datetime import datetime
 import math  # For isnan checks
 import re  # For parsing metadata and rule strings
@@ -60,6 +61,8 @@ class SymbolicReasoner:
         self.rule_activations: List[Dict[str, Any]] = []  # History of activations per step
         self.state_history_limit = 10  # Keep short history for change calculation
         self.state_history: List[Dict[str, Any]] = []
+        self._sensor_thresholds: Dict[str, Dict[str, float]] = {}
+        self._temporal_thresholds: Dict[str, Dict[str, float]] = {}
 
         self.rule_learner = RuleLearner()
         self.state_tracker = StateTracker()
@@ -271,6 +274,86 @@ class SymbolicReasoner:
             self.logger.debug(f"Could not query {predicate}/{subject}: {e}")
         return None
 
+    def get_sensor_thresholds(self) -> Dict[str, Dict[str, float]]:
+        """Read the training-derived static thresholds from ``rules.pl``."""
+        high, low = {}, {}
+        for solution in self.prolog.query("sensor_high_threshold(S, V)."):
+            high[str(solution['S'])] = float(solution['V'])
+        for solution in self.prolog.query("sensor_low_threshold(S, V)."):
+            low[str(solution['S'])] = float(solution['V'])
+        self._sensor_thresholds = {'high': high, 'low': low}
+        return self._sensor_thresholds
+
+    def set_temporal_thresholds(self, thresholds: Dict[str, Dict[str, float]]) -> None:
+        """Assert training-derived temporal thresholds into the Prolog KB."""
+        self._temporal_thresholds = thresholds or {}
+        list(self.prolog.query("retractall(temporal_threshold(_, _, _))"))
+        for sensor, values in self._temporal_thresholds.items():
+            if not re.match(r'^[a-z][a-zA-Z0-9_]*$', str(sensor)):
+                continue
+            for kind, value in values.items():
+                if kind == 'moving_average_cycles' or kind == 'training_windows':
+                    continue
+                list(self.prolog.query(
+                    f"assertz(temporal_threshold({sensor}, {kind}, {float(value):.6f}))"
+                ))
+        self.logger.info("Asserted temporal thresholds for %d sensors.",
+                         len(self._temporal_thresholds))
+
+    def _retract_temporal_facts(self) -> None:
+        """Remove temporal facts that belong to the previous window."""
+        for query in [
+            "retractall(sensor_slope(_, _))",
+            "retractall(sensor_relative_change(_, _))",
+            "retractall(sensor_moving_average(_, _))",
+            "retractall(sensor_std(_, _))",
+            "retractall(sensor_persistence(_, _, _))",
+        ]:
+            list(self.prolog.query(query))
+
+    def _assert_temporal_snapshot(self, window: np.ndarray,
+                                  feature_names: List[str]) -> None:
+        """Assert slope, relative change, moving average, std and persistence."""
+        values = np.asarray(window, dtype=float)
+        if values.ndim != 2 or values.shape[1] != len(feature_names):
+            self.logger.warning(
+                "Skipping temporal snapshot: expected (n, %d) window, got %s.",
+                len(feature_names), values.shape,
+            )
+            return
+        if not np.isfinite(values).all():
+            self.logger.warning("Skipping temporal snapshot with NaN/Inf values.")
+            return
+
+        high = self._sensor_thresholds.get('high', {})
+        low = self._sensor_thresholds.get('low', {})
+        features = window_temporal_features(values, feature_names, high, low)
+        for name in feature_names:
+            if not re.match(r'^[a-z][a-zA-Z0-9_]*$', str(name)):
+                continue
+            list(self.prolog.query(
+                f"assertz(sensor_slope({name}, {features['slope'][name]:.6f}))"
+            ))
+            list(self.prolog.query(
+                "assertz(sensor_relative_change("
+                f"{name}, {features['relative_change'][name]:.6f}))"
+            ))
+            list(self.prolog.query(
+                "assertz(sensor_moving_average("
+                f"{name}, {features['moving_average'][name]:.6f}))"
+            ))
+            list(self.prolog.query(
+                f"assertz(sensor_std({name}, {features['std'][name]:.6f}))"
+            ))
+            list(self.prolog.query(
+                "assertz(sensor_persistence("
+                f"{name}, above, {features['persistence_above'][name]}))"
+            ))
+            list(self.prolog.query(
+                "assertz(sensor_persistence("
+                f"{name}, below, {features['persistence_below'][name]}))"
+            ))
+
     def _assert_sensor_snapshot(self, feature_names: List[str],
                                 current_values: np.ndarray,
                                 previous_values: np.ndarray) -> None:
@@ -312,6 +395,7 @@ class SymbolicReasoner:
             "retractall(sensor_delta(_, _))",
         ]:
             list(self.prolog.query(query))
+        self._retract_temporal_facts()
         for key, value in numeric_values.items():
             list(self.prolog.query(f"assertz(current_sensor_value({key}, {value:.6f}))"))
 
@@ -643,7 +727,157 @@ class SymbolicReasoner:
         """Get the complete history of detailed rule activations recorded by the reasoner."""
         return list(self.rule_activations)
 
-    def reason(self, sensor_dict: Dict[str, Any]) -> List[str]:
+    def get_active_learned_rule_names(self) -> List[str]:
+        """Return learned rule heads activated during the latest ``reason`` call."""
+        if not self.rule_activations:
+            return []
+        return [
+            detail.get('rule')
+            for detail in self.rule_activations[-1].get('activated_rules_detailed', [])
+            if detail.get('type') == 'learned' and detail.get('rule')
+        ]
+
+    def validate_learned_rules(
+            self,
+            input_data: np.ndarray,
+            feature_names: List[str],
+            labels: np.ndarray,
+            min_precision: float = 0.9,
+            min_support: int = 5,
+            max_false_positive_rate: float = 0.05,
+            apply: bool = False,
+    ) -> Dict[str, Any]:
+        """Validate learned rules on held-out validation windows.
+
+        A rule is accepted only if it fires at least ``min_support`` times,
+        reaches ``min_precision`` among its alerts and its false-positive rate
+        over all negative windows stays below ``max_false_positive_rate``.
+        When ``apply`` is true, rejected rules are removed from the learned
+        rule store and the sidecar file is atomically rewritten.
+        """
+        X = np.asarray(input_data)
+        y = np.asarray(labels, dtype=int).ravel()
+        if X.ndim != 3:
+            raise ValueError("input_data must have shape (windows, timesteps, features).")
+        if len(X) != len(y):
+            raise ValueError("input_data and labels must contain the same number of windows.")
+
+        rule_keys = list(self.learned_rules.keys())
+        if not rule_keys:
+            return {
+                'summary': {
+                    'rules_evaluated': 0,
+                    'accepted': 0,
+                    'rejected': 0,
+                    'min_precision': float(min_precision),
+                    'min_support': int(min_support),
+                    'max_false_positive_rate': float(max_false_positive_rate),
+                },
+                'rules': [],
+                'applied': bool(apply),
+            }
+
+        heads = {}
+        for rule_key in rule_keys:
+            match = re.match(
+                r"^\s*([a-zA-Z0-9_]+)\s*(?::-\s*.*)?\.",
+                rule_key.strip(),
+            )
+            if match:
+                heads[rule_key] = match.group(1)
+
+        stats = {
+            rule_key: {'support': 0, 'true_positives': 0, 'false_positives': 0}
+            for rule_key in rule_keys
+        }
+        total_negatives = int(np.sum(y == 0))
+        self._retract_temporal_facts()
+
+        for index, sequence in enumerate(X):
+            sequence = np.asarray(sequence)
+            if sequence.shape[0] < 2:
+                continue
+            self._assert_sensor_snapshot(
+                feature_names, sequence[-1], sequence[-2]
+            )
+            label = int(y[index])
+            for rule_key, head in heads.items():
+                try:
+                    fired = bool(list(self.prolog.query(f"{head}.")))
+                except Exception as error:
+                    self.logger.warning(
+                        "Could not validate learned rule %s: %s - %s",
+                        head, type(error).__name__, error,
+                    )
+                    fired = False
+                if not fired:
+                    continue
+                stats[rule_key]['support'] += 1
+                if label == 1:
+                    stats[rule_key]['true_positives'] += 1
+                else:
+                    stats[rule_key]['false_positives'] += 1
+
+        rows = []
+        for rule_key in rule_keys:
+            rule_stats = stats[rule_key]
+            support = rule_stats['support']
+            true_positives = rule_stats['true_positives']
+            false_positives = rule_stats['false_positives']
+            precision = true_positives / support if support else 0.0
+            false_positive_rate = (
+                false_positives / total_negatives if total_negatives else 0.0
+            )
+            reasons = []
+            if rule_key not in heads:
+                reasons.append('unparseable_rule')
+            if support < min_support:
+                reasons.append('insufficient_support')
+            if precision < min_precision:
+                reasons.append('low_precision')
+            if false_positive_rate > max_false_positive_rate:
+                reasons.append('high_false_positive_rate')
+            rows.append({
+                'rule': rule_key,
+                'support': support,
+                'true_positives': true_positives,
+                'false_positives': false_positives,
+                'precision': precision,
+                'false_positive_rate': false_positive_rate,
+                'accepted': not reasons,
+                'rejection_reasons': reasons,
+            })
+
+        rejected = [row['rule'] for row in rows if not row['accepted']]
+        if apply and rejected:
+            for rule_key in rejected:
+                self.learned_rules.pop(rule_key, None)
+            self._body_to_key = {}
+            for rule_key in self.learned_rules:
+                body = _extract_rule_body(rule_key)
+                if body:
+                    self._body_to_key[body] = rule_key
+            self._rewrite_rules_file()
+            self.logger.info(
+                "Removed %d learned rule(s) rejected on validation.",
+                len(rejected),
+            )
+
+        return {
+            'summary': {
+                'rules_evaluated': len(rows),
+                'accepted': len(rows) - len(rejected),
+                'rejected': len(rejected),
+                'min_precision': float(min_precision),
+                'min_support': int(min_support),
+                'max_false_positive_rate': float(max_false_positive_rate),
+            },
+            'rules': rows,
+            'applied': bool(apply),
+        }
+
+    def reason(self, sensor_dict: Dict[str, Any],
+               window: Optional[np.ndarray] = None) -> List[str]:
         """
         Apply symbolic reasoning rules based on the current sensor state.
         Asserts current facts, queries base and learned rules, and records activations.
@@ -652,6 +886,8 @@ class SymbolicReasoner:
             sensor_dict (Dict[str, Any]): Dictionary containing current sensor readings
                                           and potentially other metrics (e.g., efficiency).
                                           Keys must match Prolog expectations (e.g., 'temperature').
+            window (Optional[np.ndarray]): Full ``(window_size, features)`` window used
+                                          for temporal rules. If omitted, temporal facts are cleared.
 
         Returns:
             List[str]: A list of human-readable insights derived from activated rules.
@@ -720,6 +956,10 @@ class SymbolicReasoner:
                 list(self.prolog.query(f"assertz(sensor_change({key}, {change:.6f}))"))
                 list(self.prolog.query(f"assertz(sensor_delta({key}, {deltas[key]:.6f}))"))
 
+            self._retract_temporal_facts()
+            if window is not None:
+                self._assert_temporal_snapshot(window, list(current_values.keys()))
+
             self.logger.debug("Asserted facts into Prolog KB")
 
         except Exception as e:
@@ -737,6 +977,12 @@ class SymbolicReasoner:
             "HPC critical pattern": "hpc_critical_pattern",
             "HPC thermal overload": "hpc_thermal_overload",
             "HPC fuel starvation": "hpc_fuel_starvation",
+            "HPC temperature rising trend": "temporal_trend(s4, increasing)",
+            "HPC outlet pressure falling trend": "temporal_trend(s7, decreasing)",
+            "HPC static pressure persistent high": "temporal_persistence(s11, above)",
+            "HPC thermal-pressure degradation": "temporal_thermal_pressure_degradation",
+            "HPC temperature variability high": "temporal_high_variability(s4)",
+            "HPC moving-average temperature high": "temporal_moving_average_high(s4)",
         }
         for insight_desc, query_string in base_queries.items():
             try:

@@ -19,6 +19,12 @@ RULE_ALARM_INSIGHTS = {
     'HPC critical pattern',
     'HPC thermal overload',
     'HPC fuel starvation',
+    'HPC temperature rising trend',
+    'HPC outlet pressure falling trend',
+    'HPC static pressure persistent high',
+    'HPC thermal-pressure degradation',
+    'HPC temperature variability high',
+    'HPC moving-average temperature high',
 }
 
 REASON_PRIORITY = {
@@ -55,12 +61,16 @@ class HITLQueue:
     """In-memory queue with CSV/JSON export and human feedback updates."""
 
     def __init__(self, uncertain_low: float = 0.4, uncertain_high: float = 0.6,
-                 output_dir: str = 'results', max_cases: int = 200):
+                 output_dir: str = 'results', max_cases: int = 200,
+                 decision_threshold: Optional[float] = None):
         """Configure uncertainty bounds and persistence paths."""
         self.uncertain_low = float(uncertain_low)
         self.uncertain_high = float(uncertain_high)
         self.output_dir = output_dir
         self.max_cases = int(max_cases)
+        self.decision_threshold = (
+            None if decision_threshold is None else float(decision_threshold)
+        )
         self.cases: List[HITLCase] = []
         self._next_id = 1
         self.csv_path = os.path.join(output_dir, 'hitl_queue.csv')
@@ -202,6 +212,7 @@ class HITLQueue:
             'metadata': {
                 'uncertain_low': self.uncertain_low,
                 'uncertain_high': self.uncertain_high,
+                'decision_threshold': self.decision_threshold,
                 'max_cases': self.max_cases,
                 'exported_at': datetime.now().isoformat(),
             },
@@ -222,6 +233,7 @@ class HITLQueue:
             uncertain_high=metadata.get('uncertain_high', 0.6),
             output_dir=os.path.dirname(os.path.abspath(path)),
             max_cases=metadata.get('max_cases', 200),
+            decision_threshold=metadata.get('decision_threshold'),
         )
         for case_data in payload.get('cases', []):
             queue.cases.append(HITLCase(**case_data))

@@ -21,12 +21,31 @@ model:
     - s20
     - s21
   input_shape: [30, 14]
-  architecture: "light_classifier"
+  # Explicit architecture. The legacy "light_classifier" alias is still accepted.
+  architecture: "random_forest"
   random_state: 42
   light_classifier:
     n_estimators: 100
     max_depth: 10
     class_weight: "balanced"
+
+# ===============================
+# Probability Calibration
+# ===============================
+calibration:
+  enabled: true
+  method: "sigmoid"       # sigmoid (small/imbalanced) or isotonic
+  cv_folds: 5
+  n_bins: 10
+
+# ===============================
+# Decision Threshold
+# ===============================
+thresholding:
+  strategy: "recall_at_precision"  # f1 | recall_at_precision | fbeta
+  min_precision: 0.75              # validation constraint for recall_at_precision
+  beta: 2.0                        # only used by fbeta
+  fallback: 0.5
 
 # ===============================
 # Training Configuration
@@ -42,10 +61,19 @@ training:
 # ===============================
 hitl:
   enabled: true
-  uncertain_low: 0.4
+  # The uncertainty band can follow the validation-selected threshold.
+  center_on_threshold: true
+  uncertainty_margin: 0.10
+  uncertain_low: 0.4       # used when center_on_threshold is false
   uncertain_high: 0.6
   max_cases: 200
   sample_per_bucket: 300
+  rule_validation:
+    enabled: true
+    min_precision: 0.9
+    min_support: 5
+    max_false_positive_rate: 0.05
+    apply: true
 
 # ===============================
 # Path Configuration
@@ -67,3 +95,30 @@ symbolic_reasoning:
   min_confidence: 0.7
   max_rules: 100
   pruning_strategy: 'confidence'
+
+# ===============================
+# ProbLog Learned-Rule Injection
+# ===============================
+problog:
+  learned_rule_weight: 0.15       # per active human rule
+  max_active_learned_rules: 3     # cap on the learned noisy-or contribution
+
+# ===============================
+# Temporal Symbolic Reasoning
+# ===============================
+temporal:
+  enabled: true
+  percentile: 75.0                # training-only threshold percentile
+  moving_average_cycles: 5
+
+# ===============================
+# Engine-level Evaluation
+# ===============================
+engine_metrics:
+  enabled: true
+
+# ===============================
+# Input Data Quality
+# ===============================
+preprocessing:
+  non_finite_policy: zero        # zero | error

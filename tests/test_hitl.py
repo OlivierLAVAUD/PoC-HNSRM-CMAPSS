@@ -10,7 +10,7 @@ import unittest
 
 from src.hitl.feedback import FeedbackRecorder
 from src.hitl.queue import HITLQueue
-from src.reasoning.prob_query import EXAMPLES
+from src.reasoning.prob_query import EXAMPLES, RULES_PATH, evaluate_state
 from src.reasoning.reasoning import SymbolicReasoner
 
 
@@ -119,6 +119,18 @@ class TestHITLQueueAndFeedback(unittest.TestCase):
             insight.startswith('Learned Rule Activated: hitl_rule_1')
             for insight in insights
         ))
+
+        active_learned = reasoner.get_active_learned_rule_names()
+        self.assertIn('hitl_rule_1', active_learned)
+        with open(RULES_PATH, 'r') as file:
+            problog_program = file.read()
+        base_risk = evaluate_state(problog_program, EXAMPLES['critical'])
+        learned_risk = evaluate_state(
+            problog_program, EXAMPLES['critical'],
+            learned_rules=active_learned, learned_rule_weight=0.15,
+        )
+        self.assertGreater(learned_risk['failure_risk'],
+                           base_risk['failure_risk'])
 
 
 if __name__ == '__main__':

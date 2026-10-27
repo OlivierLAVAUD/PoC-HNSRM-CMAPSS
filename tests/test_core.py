@@ -50,6 +50,24 @@ class TestANSRDTCore(unittest.TestCase):
         with self.assertRaises(ValueError):
             core.preprocess_data(np.array([1, 2, 3]))
 
+    def test_preprocess_replaces_non_finite_and_records_quality(self):
+        core = self._build_core()
+        data = np.ones((10, 7), dtype=np.float32)
+        data[0, 0] = np.nan
+        data[1, 1] = np.inf
+        cleaned = core.preprocess_data(data)
+        self.assertTrue(np.isfinite(cleaned).all())
+        self.assertEqual(core.last_data_quality['non_finite_inputs'], 2)
+        self.assertEqual(core.last_data_quality['policy'], 'zero')
+
+    def test_preprocess_can_reject_non_finite_values(self):
+        self.config['preprocessing'] = {'non_finite_policy': 'error'}
+        core = self._build_core()
+        data = np.ones((10, 7), dtype=np.float32)
+        data[0, 0] = np.nan
+        with self.assertRaises(ValueError):
+            core.preprocess_data(data)
+
     def test_update_state(self):
         classifier = MagicMock()
         classifier.positive_proba.return_value = np.array([0.6])
@@ -67,6 +85,9 @@ class TestANSRDTCore(unittest.TestCase):
         self.assertEqual(state['insights'], ['High temperature', 'Low pressure'])
         self.assertEqual(state['rule_activations'], ['rule_a'])
         self.assertEqual(len(core.state_history), 1)
+        _, kwargs = reasoner.reason.call_args
+        self.assertIn('window', kwargs)
+        np.testing.assert_array_equal(kwargs['window'], sensor_data)
 
 
 if __name__ == '__main__':

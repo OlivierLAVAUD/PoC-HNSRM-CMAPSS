@@ -1,9 +1,20 @@
+"""Legacy synthetic-loop controller.
+
+This module is intentionally isolated from the C-MAPSS FD001 pipeline. Its
+inputs (``temperature``, ``vibration``, ``pressure``, ``efficiency_index``)
+belong to the original synthetic demonstration, not to FD001 sensors.
+"""
+
 import numpy as np
-from typing import Dict, List, Tuple
+from typing import Dict, List
 import logging
+
+LEGACY_ONLY = True
 
 
 class AdaptiveController:
+    scope = 'legacy_synthetic_only'
+
     def __init__(self, window_size: int = 10):
         self.logger = logging.getLogger(__name__)
         self.window_size = window_size

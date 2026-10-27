@@ -15,6 +15,12 @@
 :- dynamic current_sensor_value/2.
 :- dynamic sensor_change/2.
 :- dynamic sensor_delta/2.
+:- dynamic sensor_slope/2.
+:- dynamic sensor_relative_change/2.
+:- dynamic sensor_moving_average/2.
+:- dynamic sensor_std/2.
+:- dynamic sensor_persistence/3.
+:- dynamic temporal_threshold/3.
 
 % ---------------------------------------------------------------------------
 % Sensor direction and training-derived thresholds
@@ -162,3 +168,48 @@ sequence_pattern(hpc_degradation_trend) :-
     trend(s4, increasing),
     trend(s11, increasing),
     trend(s7, decreasing).
+
+% ---------------------------------------------------------------------------
+% Temporal window features (thresholds are asserted from training windows)
+% ---------------------------------------------------------------------------
+temporal_trend(Sensor, increasing) :-
+    sensor_slope(Sensor, Slope),
+    temporal_threshold(Sensor, slope_abs, SlopeThreshold),
+    Slope > SlopeThreshold,
+    sensor_relative_change(Sensor, Relative),
+    temporal_threshold(Sensor, relative_change_abs, RelativeThreshold),
+    Relative > RelativeThreshold.
+
+temporal_trend(Sensor, decreasing) :-
+    sensor_slope(Sensor, Slope),
+    temporal_threshold(Sensor, slope_abs, SlopeThreshold),
+    Slope < -SlopeThreshold,
+    sensor_relative_change(Sensor, Relative),
+    temporal_threshold(Sensor, relative_change_abs, RelativeThreshold),
+    Relative < -RelativeThreshold.
+
+temporal_persistence(Sensor, above) :-
+    sensor_persistence(Sensor, above, Count),
+    temporal_threshold(Sensor, persistence, Minimum),
+    Count >= Minimum.
+
+temporal_persistence(Sensor, below) :-
+    sensor_persistence(Sensor, below, Count),
+    temporal_threshold(Sensor, persistence, Minimum),
+    Count >= Minimum.
+
+temporal_high_variability(Sensor) :-
+    sensor_std(Sensor, Std),
+    temporal_threshold(Sensor, std, StdThreshold),
+    Std > StdThreshold.
+
+temporal_moving_average_high(Sensor) :-
+    sensor_moving_average(Sensor, Average),
+    sensor_high_threshold(Sensor, Threshold),
+    Average > Threshold.
+
+temporal_thermal_pressure_degradation :-
+    temporal_trend(s4, increasing),
+    ( temporal_trend(s7, decreasing)
+    ; temporal_persistence(s11, above)
+    ).
