@@ -33,6 +33,11 @@ class LightClassifier:
         self.is_calibrated: bool = False
         self.calibration_method: Optional[str] = None
         self.calibration_cv_folds: Optional[int] = None
+        self.temporal_feature_extractor: Any = None
+        self.rul_regressor: Any = None
+        self.feature_names_out: Optional[list] = None
+        self.uses_temporal_features: bool = False
+        self.uses_rul_feature: bool = False
 
     @staticmethod
     def _build_estimator(architecture: str, random_state: int, kwargs: dict) -> Any:
@@ -53,6 +58,32 @@ class LightClassifier:
                 max_iter=int(kwargs.get("max_iter", 300)),
                 random_state=random_state,
             )
+        if name in ("lightgbm", "lgbm", "lightgbm_classifier"):
+            try:
+                from lightgbm import LGBMClassifier
+            except ImportError as error:  # pragma: no cover - install guidance
+                raise ImportError(
+                    "LightGBM is required for architecture='lightgbm'. "
+                    "Install it with `pip install 'lightgbm>=4.5,<5'`."
+                ) from error
+
+            params = {
+                "n_estimators": int(kwargs.get("n_estimators", 300)),
+                "learning_rate": float(kwargs.get("learning_rate", 0.05)),
+                "num_leaves": int(kwargs.get("num_leaves", 31)),
+                "max_depth": int(kwargs.get("max_depth", -1)),
+                "min_child_samples": int(kwargs.get("min_child_samples", 20)),
+                "subsample": float(kwargs.get("subsample", 0.9)),
+                "colsample_bytree": float(kwargs.get("colsample_bytree", 0.9)),
+                "reg_lambda": float(kwargs.get("reg_lambda", 0.0)),
+                "class_weight": kwargs.get("class_weight", "balanced"),
+                "random_state": random_state,
+                "n_jobs": -1,
+                "verbosity": -1,
+            }
+            if params["subsample"] < 1.0:
+                params["subsample_freq"] = 1
+            return LGBMClassifier(**params)
         raise ValueError(f"Unsupported light classifier architecture: {architecture}")
 
     def _flatten(self, X: np.ndarray) -> np.ndarray:
@@ -153,6 +184,33 @@ class LightClassifier:
         if 1 in classes:
             return proba[:, classes.index(1)]
         return np.zeros(len(proba), dtype=np.float32)
+
+    def prepare_base_features(self, X: np.ndarray) -> np.ndarray:
+        """Apply temporal extraction/flattening without the RUL feature."""
+        array = np.asarray(X, dtype=np.float32)
+        if self.temporal_feature_extractor is not None:
+            if array.ndim != 3:
+                raise ValueError(
+                    "This model requires raw 3D windows for temporal feature "
+                    f"extraction, got shape {array.shape}."
+                )
+            return self.temporal_feature_extractor.transform(array)
+        if array.ndim == 3:
+            return array.reshape(array.shape[0], -1)
+        return array
+
+    def prepare_features(self, X: np.ndarray) -> np.ndarray:
+        """Apply the persisted temporal/RUL feature bundle to raw windows.
+
+        Training code passes already engineered matrices and therefore calls
+        the estimator directly. Inference calls this helper with raw 3D windows
+        so saved LightGBM artifacts remain self-contained.
+        """
+        array = self.prepare_base_features(X)
+        if self.rul_regressor is not None and self.uses_rul_feature:
+            predicted_rul = self.rul_regressor.predict(array).reshape(-1, 1)
+            array = np.hstack([array, predicted_rul])
+        return array
 
     @property
     def classes_(self) -> np.ndarray:

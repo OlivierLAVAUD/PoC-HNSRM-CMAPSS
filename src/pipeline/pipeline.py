@@ -3,6 +3,7 @@
 import json
 import logging
 import os
+import time
 from datetime import datetime
 from typing import Any, Dict, Optional
 
@@ -21,6 +22,7 @@ from src.data.cmapss_loader import CMAPSSLoader
 from src.data.data_loader import DataLoader, create_data_loader
 from src.data.data_processing import map_labels
 from src.evaluation.calibration import calibration_metrics, save_reliability_plot
+from src.evaluation.alerting import compare_alerting
 from src.evaluation.engine_metrics import (
     compute_engine_metrics,
     export_engine_metrics_csv,
@@ -29,8 +31,18 @@ from src.evaluation.thresholding import (
     save_precision_recall_plot,
     select_threshold,
 )
+from src.features.temporal_features import TemporalFeatureExtractor
+from src.fusion.probability_fusion import (
+    ProbabilityFusion,
+    evaluate_probability_fusion,
+    symbolic_rule_score,
+)
 from src.hitl.queue import HITLQueue, REASON_PRIORITY
 from src.models.light_classifier import LightClassifier
+from src.models.rul_regressor import (
+    RULLightGBMRegressor,
+    out_of_fold_predictions,
+)
 from src.preprocessing.preprocessing import preprocess_sequences
 from src.reasoning.prob_query import RULES_PATH as PROB_RULES_PATH, evaluate_state
 from src.reasoning.reasoning import SymbolicReasoner
@@ -95,7 +107,9 @@ def _validate_model_and_training(config: dict) -> None:
             )
 
         architecture = model.get('architecture', 'random_forest')
-        if architecture not in {'random_forest', 'light_classifier', 'cnn_lstm'}:
+        if architecture not in {
+                'random_forest', 'light_classifier', 'lightgbm',
+                'lgbm', 'lightgbm_classifier', 'cnn_lstm'}:
             raise ValueError(f"Unsupported model.architecture: {architecture!r}.")
 
     if training:
@@ -119,8 +133,11 @@ def _validate_model_and_training(config: dict) -> None:
 
     calibration = config.get('calibration', {})
     if calibration.get('enabled', False):
-        if calibration.get('method', 'sigmoid') not in {'sigmoid', 'isotonic'}:
-            raise ValueError("calibration.method must be 'sigmoid' or 'isotonic'.")
+        if calibration.get('method', 'sigmoid') not in {
+                'sigmoid', 'isotonic', 'auto'}:
+            raise ValueError(
+                "calibration.method must be 'sigmoid', 'isotonic' or 'auto'."
+            )
         if 'cv_folds' in calibration and (
                 not isinstance(calibration['cv_folds'], int)
                 or calibration['cv_folds'] < 2):
@@ -156,6 +173,104 @@ def _validate_model_and_training(config: dict) -> None:
             not isinstance(temporal['moving_average_cycles'], int)
             or temporal['moving_average_cycles'] < 1):
         raise ValueError("temporal.moving_average_cycles must be an integer >= 1.")
+
+    features = config.get('features', {})
+    temporal_features = features.get('temporal', {})
+    if temporal_features.get('enabled', False):
+        for key in ('percentile_low', 'percentile_high'):
+            if key in temporal_features:
+                _require_range(
+                    temporal_features[key], f'features.temporal.{key}',
+                    0.0, 100.0,
+                )
+        low = temporal_features.get('percentile_low', 25.0)
+        high = temporal_features.get('percentile_high', 75.0)
+        if low >= high:
+            raise ValueError(
+                "features.temporal.percentile_low must be smaller than "
+                "features.temporal.percentile_high."
+            )
+        if 'moving_average_cycles' in temporal_features and (
+                not isinstance(
+                    temporal_features['moving_average_cycles'], int
+                ) or temporal_features['moving_average_cycles'] < 1):
+            raise ValueError(
+                "features.temporal.moving_average_cycles must be an integer >= 1."
+            )
+        apply_to = temporal_features.get('apply_to_architectures')
+        if apply_to is not None and not isinstance(apply_to, list):
+            raise ValueError(
+                "features.temporal.apply_to_architectures must be a list."
+            )
+
+    alerting = config.get('alerting', {})
+    if alerting.get('enabled', False):
+        ks = alerting.get('consecutive_ks', [2, 3])
+        if (not isinstance(ks, list)
+                or not all(isinstance(k, int) and k >= 1 for k in ks)):
+            raise ValueError(
+                "alerting.consecutive_ks must be a list of integers >= 1."
+            )
+        if 'smoothing_cycles' in alerting and (
+                not isinstance(alerting['smoothing_cycles'], int)
+                or alerting['smoothing_cycles'] < 1):
+            raise ValueError(
+                "alerting.smoothing_cycles must be an integer >= 1."
+            )
+
+    rul = config.get('rul_regression', {})
+    if rul.get('enabled', False):
+        if 'cv_folds' in rul and (
+                not isinstance(rul['cv_folds'], int) or rul['cv_folds'] < 2):
+            raise ValueError("rul_regression.cv_folds must be an integer >= 2.")
+        apply_to = rul.get('apply_to_architectures')
+        if apply_to is not None and not isinstance(apply_to, list):
+            raise ValueError(
+                "rul_regression.apply_to_architectures must be a list."
+            )
+
+    fusion = config.get('fusion', {})
+    if fusion.get('enabled', False):
+        _require_range(fusion.get('min_precision', 0.75),
+                       'fusion.min_precision', 0.0, 1.0)
+        if fusion.get('threshold_strategy', 'recall_at_precision') not in {
+                'f1', 'recall_at_precision', 'fbeta'}:
+            raise ValueError(
+                "fusion.threshold_strategy must be 'f1', "
+                "'recall_at_precision' or 'fbeta'."
+            )
+        apply_to = fusion.get('apply_to_architectures')
+        if apply_to is not None and not isinstance(apply_to, list):
+            raise ValueError(
+                "fusion.apply_to_architectures must be a list."
+            )
+
+    experiments = config.get('experiments', {}).get('compare_models', {})
+    if experiments.get('enabled', False):
+        models = experiments.get('models', ['random_forest', 'lightgbm'])
+        allowed = {'random_forest', 'lightgbm'}
+        if (not isinstance(models, list) or not models
+                or not all(isinstance(name, str) for name in models)):
+            raise ValueError(
+                "experiments.compare_models.models must be a non-empty list."
+            )
+        invalid = [name for name in models if name not in allowed]
+        if invalid:
+            raise ValueError(
+                f"Unsupported comparison models: {invalid}. "
+                f"Allowed: {sorted(allowed)}."
+            )
+        metric = experiments.get('selection_metric', 'fbeta')
+        if metric not in {'f1', 'fbeta', 'recall', 'average_precision', 'roc_auc'}:
+            raise ValueError(
+                "experiments.compare_models.selection_metric must be one of "
+                "f1, fbeta, recall, average_precision, roc_auc."
+            )
+        if experiments.get('selection_split', 'validation') != 'validation':
+            raise ValueError(
+                "experiments.compare_models.selection_split must be 'validation'; "
+                "the official test split cannot drive model selection."
+            )
 
     preprocessing = config.get('preprocessing', {})
     if preprocessing.get('non_finite_policy', 'zero') not in {
@@ -252,17 +367,37 @@ class ANSRDTPipeline:
         self.reasoner: Optional[SymbolicReasoner] = None
         self.temporal_thresholds: Dict[str, Any] = {}
 
-    def _build_classifier(self) -> LightClassifier:
+    @staticmethod
+    def _normalise_architecture(architecture: str) -> str:
+        """Return the canonical architecture name."""
+        name = str(architecture or 'random_forest').lower()
+        if name in ('cnn_lstm', 'light_classifier'):
+            return 'random_forest'
+        if name in ('lgbm', 'lightgbm_classifier'):
+            return 'lightgbm'
+        return name
+
+    @staticmethod
+    def _applies_to(section: dict, architecture: str) -> bool:
+        """Return True when a feature section targets this architecture."""
+        if not section.get('enabled', False):
+            return False
+        targets = section.get('apply_to_architectures')
+        if targets is None:
+            return True
+        return architecture in {str(target).lower() for target in targets}
+
+    def _build_classifier(
+            self, architecture: Optional[str] = None) -> LightClassifier:
         """Create the configured lightweight classifier."""
         model_config = self.config.get('model', {})
-        architecture = model_config.get('architecture', 'random_forest')
-        if architecture in ('cnn_lstm', 'light_classifier'):
-            self.logger.warning(
-                "Architecture alias '%s' is deprecated; using 'random_forest'.",
-                architecture,
-            )
-            architecture = 'random_forest'
-        options = dict(model_config.get('light_classifier', {}))
+        architecture = self._normalise_architecture(
+            architecture or model_config.get('architecture', 'random_forest')
+        )
+        if architecture not in {'random_forest', 'lightgbm', 'mlp'}:
+            raise ValueError(f"Unsupported architecture: {architecture!r}")
+        option_key = 'lightgbm' if architecture == 'lightgbm' else 'light_classifier'
+        options = dict(model_config.get(option_key, {}))
         return LightClassifier(
             architecture=architecture,
             random_state=int(model_config.get('random_state', 42)),
@@ -296,32 +431,89 @@ class ANSRDTPipeline:
         """Apply a fitted scaler to a 3D window array."""
         return scaler.transform(X.reshape(-1, X.shape[-1])).reshape(X.shape)
 
-    def _calibrate_model(self, X_train_scaled: np.ndarray,
-                         y_train: np.ndarray) -> Dict[str, Any]:
-        """Calibrate the classifier on training data only."""
+    def _calibrate_model(self, X_train: np.ndarray, y_train: np.ndarray,
+                         X_val: np.ndarray,
+                         y_val: np.ndarray) -> Dict[str, Any]:
+        """Calibrate on training data and select the method on validation only."""
         calibration_config = self.config.get('calibration', {})
         if not calibration_config.get('enabled', True):
             self.logger.info("Probability calibration disabled by configuration.")
             return {'enabled': False, 'applied': False}
 
-        method = calibration_config.get('method', 'sigmoid')
+        method = str(calibration_config.get('method', 'sigmoid')).lower()
         cv_folds = int(calibration_config.get('cv_folds', 5))
-        self.model.calibrate(X_train_scaled, y_train, method=method, cv_folds=cv_folds)
+        requested_method = method
+        candidates = []
+        if method == 'auto':
+            methods = ['sigmoid', 'isotonic']
+        else:
+            methods = [method]
+
+        for candidate in methods:
+            try:
+                self.model.calibrate(
+                    X_train, y_train, method=candidate, cv_folds=cv_folds
+                )
+            except (ValueError, RuntimeError) as error:
+                self.logger.warning(
+                    "Calibration candidate %s failed: %s", candidate, error
+                )
+                continue
+            if not getattr(self.model, 'is_calibrated', False):
+                continue
+            candidate_scores = self.model.positive_proba(X_val)
+            candidate_metrics = calibration_metrics(
+                y_val, candidate_scores,
+                n_bins=int(calibration_config.get('n_bins', 10)),
+            )
+            candidates.append({
+                'method': candidate,
+                'validation_brier_score': candidate_metrics['brier_score'],
+                'validation_ece': candidate_metrics['ece'],
+            })
+
+        selected_method = getattr(self.model, 'calibration_method', None)
+        if method == 'auto' and candidates:
+            selected_method = min(
+                candidates,
+                key=lambda item: (
+                    item['validation_brier_score'], item['validation_ece']
+                ),
+            )['method']
+            if selected_method != getattr(self.model, 'calibration_method', None):
+                self.model.calibrate(
+                    X_train, y_train, method=selected_method,
+                    cv_folds=cv_folds,
+                )
+            self.logger.info(
+                "Calibration method selected on validation: %s", selected_method
+            )
+
         return {
             'enabled': True,
             'applied': bool(getattr(self.model, 'is_calibrated', False)),
-            'method': getattr(self.model, 'calibration_method', None),
+            'requested_method': requested_method,
+            'method': selected_method,
+            'selection_metric': (
+                'validation_brier_score' if method == 'auto' else None
+            ),
+            'candidates': candidates,
             'cv_folds': getattr(self.model, 'calibration_cv_folds', None),
         }
 
-    def _select_decision_threshold(self, y_val: np.ndarray,
-                                   val_scores: np.ndarray) -> Dict[str, Any]:
+    def _select_decision_threshold(
+            self, y_val: np.ndarray, val_scores: np.ndarray,
+            strategy: Optional[str] = None,
+            min_precision: Optional[float] = None) -> Dict[str, Any]:
         """Select a decision threshold on validation data only."""
         threshold_config = self.config.get('thresholding', {})
         selection = select_threshold(
             y_val, val_scores,
-            strategy=threshold_config.get('strategy', 'fbeta'),
-            min_precision=float(threshold_config.get('min_precision', 0.7)),
+            strategy=strategy or threshold_config.get('strategy', 'fbeta'),
+            min_precision=float(
+                threshold_config.get('min_precision', 0.7)
+                if min_precision is None else min_precision
+            ),
             beta=float(threshold_config.get('beta', 2.0)),
             fallback=float(threshold_config.get('fallback', 0.5)),
         )
@@ -330,7 +522,8 @@ class ANSRDTPipeline:
 
     def _calibration_report(self, y_val: np.ndarray, val_scores: np.ndarray,
                             y_test: np.ndarray, test_scores: np.ndarray,
-                            results_dir: str) -> Dict[str, Any]:
+                            results_dir: str,
+                            suffix: str = '') -> Dict[str, Any]:
         """Compute calibration diagnostics and persist curves."""
         n_bins = int(self.config.get('calibration', {}).get('n_bins', 10))
         report = {
@@ -342,15 +535,20 @@ class ANSRDTPipeline:
         os.makedirs(visualization_dir, exist_ok=True)
         report['validation']['reliability_plot'] = save_reliability_plot(
             report['validation'],
-            os.path.join(visualization_dir, 'reliability_validation.png'),
+            os.path.join(
+                visualization_dir,
+                f'reliability_validation{suffix}.png',
+            ),
             title='Validation reliability curve',
         )
         report['test']['reliability_plot'] = save_reliability_plot(
             report['test'],
-            os.path.join(visualization_dir, 'reliability_test.png'),
+            os.path.join(visualization_dir, f'reliability_test{suffix}.png'),
             title='Test reliability curve',
         )
-        report_path = os.path.join(results_dir, 'calibration_report.json')
+        report_path = os.path.join(
+            results_dir, f'calibration_report{suffix}.json'
+        )
         with open(report_path, 'w') as file:
             json.dump(report, file, indent=2, cls=NumpyEncoder)
         report['report_path'] = report_path
@@ -369,8 +567,9 @@ class ANSRDTPipeline:
                 self.reasoner.set_temporal_thresholds(self.temporal_thresholds)
         return self.reasoner
 
-    def _explain_representative_windows(self, X_raw: np.ndarray,
-                                        scores: np.ndarray) -> Dict[str, Any]:
+    def _explain_representative_windows(
+            self, X_raw: np.ndarray, scores: np.ndarray,
+            decision_threshold: Optional[float] = None) -> Dict[str, Any]:
         """Reason over normal, borderline and critical raw test windows."""
         if len(X_raw) == 0:
             return {}
@@ -379,7 +578,10 @@ class ANSRDTPipeline:
         with open(PROB_RULES_PATH, 'r') as file:
             problog_program = file.read()
 
-        decision_threshold = float(getattr(self.model, 'decision_threshold', 0.5))
+        decision_threshold = float(
+            getattr(self.model, 'decision_threshold', 0.5)
+            if decision_threshold is None else decision_threshold
+        )
         normal_idx = int(np.argmin(scores))
         critical_idx = int(np.argmax(scores))
         degraded_idx = int(np.argmin(np.abs(scores - decision_threshold)))
@@ -413,7 +615,9 @@ class ANSRDTPipeline:
             }
         return explanations
 
-    def _build_hitl_queue(self, X_raw: np.ndarray, scores: np.ndarray) -> Dict[str, Any]:
+    def _build_hitl_queue(self, X_raw: np.ndarray, scores: np.ndarray,
+                          decision_threshold: Optional[float] = None
+                          ) -> Dict[str, Any]:
         """Queue uncertain and rule/probability-conflicting test windows."""
         hitl_config = self.config.get('hitl', {})
         if not hitl_config.get('enabled', True) or len(X_raw) == 0:
@@ -422,6 +626,7 @@ class ANSRDTPipeline:
         decision_threshold = float(
             getattr(self.model, 'decision_threshold',
                     self.config.get('thresholding', {}).get('fallback', 0.5))
+            if decision_threshold is None else decision_threshold
         )
         if hitl_config.get('center_on_threshold', True):
             margin = float(hitl_config.get('uncertainty_margin', 0.10))
@@ -541,24 +746,31 @@ class ANSRDTPipeline:
         )
         return summary
 
-    def _run_cmapss(self) -> Dict[str, Any]:
-        """Train and evaluate the FD001 model with an engine-level split."""
-        self.logger.info("Starting C-MAPSS pipeline.")
+    def _load_cmapss_splits(self) -> Dict[str, Any]:
+        """Load FD001 windows and split whole engines into train/val/test."""
         X, y = self.data_loader.load_data()
         train_units_all = np.asarray(self.data_loader.unit_ids)
         train_cycles_all = np.asarray(self.data_loader.window_end_cycles)
         train_rul_all = np.asarray(self.data_loader.window_rul)
 
-        validation_split = float(self.config['training'].get('validation_split', 0.2))
+        validation_split = float(
+            self.config['training'].get('validation_split', 0.2)
+        )
         test_split = float(self.config['training'].get('test_split', 0.1))
-        train_fraction = float(self.config['training'].get('train_fraction', 0.2))
+        train_fraction = float(
+            self.config['training'].get('train_fraction', 0.2)
+        )
         random_state = int(self.config['training'].get('random_state', 42))
 
         if self.config['paths'].get('test_file'):
-            held_out_fraction = max(0.0, 1.0 - train_fraction - validation_split)
-            X_train, X_val, _, y_train, y_val, _ = self.data_loader.split_by_unit(
-                X, y, validation_split=validation_split,
-                test_split=held_out_fraction, random_state=random_state,
+            held_out_fraction = max(
+                0.0, 1.0 - train_fraction - validation_split
+            )
+            X_train, X_val, _, y_train, y_val, _ = (
+                self.data_loader.split_by_unit(
+                    X, y, validation_split=validation_split,
+                    test_split=held_out_fraction, random_state=random_state,
+                )
             )
             val_mask = self.data_loader.last_split_masks['val']
             val_units = train_units_all[val_mask]
@@ -570,9 +782,11 @@ class ANSRDTPipeline:
             test_rul = np.asarray(self.data_loader.window_rul)
             test_source = self.config['paths']['test_file']
         else:
-            X_train, X_val, X_test, y_train, y_val, y_test = self.data_loader.split_by_unit(
-                X, y, validation_split=validation_split,
-                test_split=test_split, random_state=random_state,
+            X_train, X_val, X_test, y_train, y_val, y_test = (
+                self.data_loader.split_by_unit(
+                    X, y, validation_split=validation_split,
+                    test_split=test_split, random_state=random_state,
+                )
             )
             masks = self.data_loader.last_split_masks
             val_units = train_units_all[masks['val']]
@@ -584,38 +798,282 @@ class ANSRDTPipeline:
             test_source = 'held-out units from training trajectories'
 
         self.logger.info(
-            "Windows: train=%d val=%d test=%d | positives: train=%d val=%d test=%d",
+            "Windows: train=%d val=%d test=%d | "
+            "positives: train=%d val=%d test=%d",
             len(X_train), len(X_val), len(X_test),
             int(y_train.sum()), int(y_val.sum()), int(y_test.sum()),
         )
+        train_mask = self.data_loader.last_split_masks['train']
+        return {
+            'X_train': X_train, 'X_val': X_val, 'X_test': X_test,
+            'y_train': y_train, 'y_val': y_val, 'y_test': y_test,
+            'train_units': np.asarray(train_units_all)[train_mask],
+            'train_cycles': np.asarray(train_cycles_all)[train_mask],
+            'train_rul': np.asarray(train_rul_all)[train_mask],
+            'val_units': val_units, 'test_units': test_units,
+            'val_cycles': val_cycles, 'test_cycles': test_cycles,
+            'val_rul': val_rul, 'test_rul': test_rul,
+            'test_source': test_source,
+        }
 
-        scaler, X_train_scaled = preprocess_sequences(X_train)
-        X_val_scaled = self._split_scaled(scaler, X_val)
-        X_test_scaled = self._split_scaled(scaler, X_test)
-
-        scaler_path = os.path.join(self.config['paths']['results_dir'], 'scaler.pkl')
-        save_scaler(scaler, scaler_path, self.logger)
-
-        self.model = self._build_classifier()
-        self.model.fit(X_train_scaled, y_train)
-        calibration_info = self._calibrate_model(X_train_scaled, y_train)
-
-        val_scores = self.model.positive_proba(X_val_scaled)
-        threshold_info = self._select_decision_threshold(y_val, val_scores)
-        model_path = os.path.join(
-            self.config['paths']['results_dir'], 'models', 'light_classifier.joblib'
+    def _model_paths(self, architecture: str,
+                     suffix: str = '') -> Dict[str, str]:
+        """Return architecture-specific model artifact paths."""
+        models_dir = os.path.join(
+            self.config['paths']['results_dir'], 'models'
         )
+        if architecture == 'lightgbm':
+            model_name = 'lightgbm_classifier'
+        else:
+            model_name = 'light_classifier'
+        return {
+            'model': os.path.join(models_dir, f'{model_name}{suffix}.joblib'),
+            'feature_extractor': os.path.join(
+                models_dir, f'temporal_features{suffix}.joblib'
+            ),
+            'feature_metadata': os.path.join(
+                self.config['paths']['results_dir'],
+                f'temporal_feature_metadata{suffix}.json'
+            ),
+            'rul_regressor': os.path.join(
+                models_dir, f'lightgbm_rul_regressor{suffix}.joblib'
+            ),
+        }
+
+    def _prepare_model_data(self, splits: Dict[str, Any],
+                            architecture: str,
+                            suffix: str = '') -> Dict[str, Any]:
+        """Build architecture-specific model inputs without test leakage."""
+        architecture = self._normalise_architecture(architecture)
+        temporal_config = self.config.get('features', {}).get('temporal', {})
+        use_temporal = (
+            architecture == 'lightgbm'
+            and self._applies_to(temporal_config, architecture)
+        )
+        extractor = None
+        scaler = None
+        feature_names_out = None
+        paths = self._model_paths(architecture, suffix)
+
+        X_train = splits['X_train']
+        X_val = splits['X_val']
+        X_test = splits['X_test']
+        if use_temporal:
+            extractor = TemporalFeatureExtractor(
+                self.feature_names,
+                include_raw_window=bool(
+                    temporal_config.get('include_raw_window', True)
+                ),
+                moving_average_cycles=int(
+                    temporal_config.get('moving_average_cycles', 5)
+                ),
+                percentile_low=float(
+                    temporal_config.get('percentile_low', 25.0)
+                ),
+                percentile_high=float(
+                    temporal_config.get('percentile_high', 75.0)
+                ),
+            )
+            X_train_model = extractor.fit_transform(X_train)
+            X_val_model = extractor.transform(X_val)
+            X_test_model = extractor.transform(X_test)
+            feature_names_out = list(extractor.feature_names_out)
+            extractor.save(paths['feature_extractor'])
+            extractor.save_metadata(paths['feature_metadata'])
+            self.logger.info(
+                "Temporal features: %d statistics + raw=%s -> %d features.",
+                len(extractor.feature_names) * 13,
+                extractor.include_raw_window,
+                len(feature_names_out),
+            )
+        elif architecture == 'lightgbm':
+            X_train_model = np.asarray(X_train).reshape(len(X_train), -1)
+            X_val_model = np.asarray(X_val).reshape(len(X_val), -1)
+            X_test_model = np.asarray(X_test).reshape(len(X_test), -1)
+            feature_names_out = [
+                f'raw__{index}' for index in range(X_train_model.shape[1])
+            ]
+        else:
+            scaler, X_train_model = preprocess_sequences(X_train)
+            X_val_model = self._split_scaled(scaler, X_val)
+            X_test_model = self._split_scaled(scaler, X_test)
+            scaler_path = os.path.join(
+                self.config['paths']['results_dir'], 'scaler.pkl'
+            )
+            save_scaler(scaler, scaler_path, self.logger)
+
+        rul_config = self.config.get('rul_regression', {})
+        regressor = None
+        rul_report = {'enabled': False, 'applied': False}
+        val_rul_prediction = None
+        test_rul_prediction = None
+        if (architecture == 'lightgbm'
+                and self._applies_to(rul_config, architecture)):
+            params = {
+                key: value for key, value in rul_config.items()
+                if key not in {
+                    'enabled', 'apply_to_architectures',
+                    'use_as_classifier_feature', 'cv_folds',
+                }
+            }
+            random_state = int(
+                self.config['model'].get('random_state', 42)
+            )
+
+            def make_regressor():
+                return RULLightGBMRegressor(
+                    random_state=random_state, logger=self.logger, **params
+                )
+
+            regressor = make_regressor()
+            train_rul = np.asarray(splits['train_rul'], dtype=float)
+            regressor.fit(X_train_model, train_rul)
+            oof_rul = out_of_fold_predictions(
+                make_regressor, X_train_model, train_rul,
+                splits['train_units'],
+                n_splits=int(rul_config.get('cv_folds', 5)),
+            )
+            val_rul_prediction = regressor.predict(X_val_model)
+            test_rul_prediction = regressor.predict(X_test_model)
+            use_as_feature = bool(
+                rul_config.get('use_as_classifier_feature', True)
+            )
+            if use_as_feature:
+                X_train_model = np.hstack([
+                    X_train_model, oof_rul.reshape(-1, 1)
+                ]).astype(np.float32)
+                X_val_model = np.hstack([
+                    X_val_model, val_rul_prediction.reshape(-1, 1)
+                ]).astype(np.float32)
+                X_test_model = np.hstack([
+                    X_test_model, test_rul_prediction.reshape(-1, 1)
+                ]).astype(np.float32)
+                feature_names_out.append('predicted_rul')
+            regressor.save(paths['rul_regressor'])
+            rul_report = {
+                'enabled': True,
+                'applied': True,
+                'model': 'lightgbm',
+                'used_as_classifier_feature': use_as_feature,
+                'model_path': paths['rul_regressor'],
+                'metrics': {
+                    'train_out_of_fold': RULLightGBMRegressor.metrics(
+                        train_rul, oof_rul
+                    ),
+                    'validation': RULLightGBMRegressor.metrics(
+                        splits['val_rul'], val_rul_prediction
+                    ),
+                    'test': RULLightGBMRegressor.metrics(
+                        splits['test_rul'], test_rul_prediction
+                    ),
+                },
+                'validation_predictions': val_rul_prediction.tolist(),
+                'test_predictions': test_rul_prediction.tolist(),
+            }
+            self.logger.info(
+                "RUL regression (validation): %s", rul_report['metrics'][
+                    'validation'
+                ]
+            )
+
+        return {
+            'architecture': architecture,
+            'X_train': X_train_model,
+            'X_val': X_val_model,
+            'X_test': X_test_model,
+            'feature_names_out': feature_names_out,
+            'extractor': extractor,
+            'scaler': scaler,
+            'rul_regressor': regressor,
+            'rul_report': rul_report,
+            'paths': paths,
+            'uses_temporal_features': use_temporal,
+            'uses_rul_feature': bool(
+                regressor is not None
+                and rul_report.get('used_as_classifier_feature', False)
+            ),
+        }
+
+    def _engine_metrics(self, units, cycles, rul, y_true, y_pred,
+                        suffix: str = '') -> Dict[str, Any]:
+        """Compute and persist per-engine metrics."""
+        if not self.config.get('engine_metrics', {}).get('enabled', True):
+            return {}
+        metrics = compute_engine_metrics(
+            units, cycles, rul, y_true, y_pred
+        )
+        results_dir = self.config['paths']['results_dir']
+        csv_path = export_engine_metrics_csv(
+            metrics,
+            os.path.join(results_dir, f'engine_metrics{suffix}.csv'),
+        )
+        return {**metrics, 'csv_path': csv_path}
+
+    def _alerting_report(self, y_true, scores, units, cycles, rul,
+                         threshold: float, suffix: str = '') -> Dict[str, Any]:
+        """Compare immediate and confirmed alerts, then persist the report."""
+        alerting_config = self.config.get('alerting', {})
+        if not self._applies_to(alerting_config, 'any'):
+            return {}
+        report = compare_alerting(
+            y_true, scores, units, cycles, rul, threshold,
+            consecutive_ks=alerting_config.get('consecutive_ks', [2, 3]),
+            smoothing_cycles=int(
+                alerting_config.get('smoothing_cycles', 3)
+            ),
+        )
+        path = os.path.join(
+            self.config['paths']['results_dir'],
+            f'alerting_analysis{suffix}.json',
+        )
+        with open(path, 'w') as file:
+            json.dump(report, file, indent=2, cls=NumpyEncoder)
+        report['report_path'] = path
+        return report
+
+    def _evaluate_architecture(self, prepared: Dict[str, Any],
+                               splits: Dict[str, Any],
+                               suffix: str = '') -> Dict[str, Any]:
+        """Fit, calibrate, threshold and evaluate one architecture."""
+        architecture = prepared['architecture']
+        self.model = self._build_classifier(architecture)
+        self.model.feature_names_out = prepared['feature_names_out']
+        self.model.uses_temporal_features = prepared['uses_temporal_features']
+        self.model.uses_rul_feature = prepared['uses_rul_feature']
+        self.model.temporal_feature_extractor = prepared['extractor']
+        self.model.rul_regressor = prepared['rul_regressor']
+
+        started = time.perf_counter()
+        self.model.fit(prepared['X_train'], splits['y_train'])
+        calibration_info = self._calibrate_model(
+            prepared['X_train'], splits['y_train'],
+            prepared['X_val'], splits['y_val'],
+        )
+        training_seconds = time.perf_counter() - started
+
+        inference_started = time.perf_counter()
+        val_scores = self.model.positive_proba(prepared['X_val'])
+        test_scores = self.model.positive_proba(prepared['X_test'])
+        inference_seconds = time.perf_counter() - inference_started
+
+        threshold_info = self._select_decision_threshold(
+            splits['y_val'], val_scores
+        )
+        model_path = prepared['paths']['model']
         self.model.save(model_path)
 
-        val_pred = (val_scores >= self.model.decision_threshold).astype(int)
-        test_scores = self.model.positive_proba(X_test_scaled)
-        test_pred = (test_scores >= self.model.decision_threshold).astype(int)
-
-        validation_metrics = self._compute_metrics(y_val, val_pred, val_scores)
-        test_metrics = self._compute_metrics(y_test, test_pred, test_scores)
+        threshold = float(self.model.decision_threshold)
+        val_pred = (val_scores >= threshold).astype(int)
+        test_pred = (test_scores >= threshold).astype(int)
+        validation_metrics = self._compute_metrics(
+            splits['y_val'], val_pred, val_scores
+        )
+        test_metrics = self._compute_metrics(
+            splits['y_test'], test_pred, test_scores
+        )
         calibration_report = self._calibration_report(
-            y_val, val_scores, y_test, test_scores,
-            self.config['paths']['results_dir'],
+            splits['y_val'], val_scores, splits['y_test'], test_scores,
+            self.config['paths']['results_dir'], suffix=suffix,
         )
         threshold_report = {
             key: value for key, value in threshold_info.items()
@@ -625,43 +1083,227 @@ class ANSRDTPipeline:
             threshold_info.get('precision_recall_curve', {}),
             os.path.join(
                 self.config['paths']['results_dir'], 'visualization',
-                'precision_recall_curve.png',
+                f'precision_recall_curve{suffix}.png',
             ),
-            threshold=self.model.decision_threshold,
+            threshold=threshold,
         )
         threshold_path = os.path.join(
-            self.config['paths']['results_dir'], 'decision_threshold.json'
+            self.config['paths']['results_dir'],
+            f'decision_threshold{suffix}.json',
         )
         with open(threshold_path, 'w') as file:
             json.dump(threshold_info, file, indent=2, cls=NumpyEncoder)
-        self.logger.info("Validation metrics: %s", validation_metrics)
-        self.logger.info("Test metrics: %s", test_metrics)
 
-        engine_metrics = {}
-        if self.config.get('engine_metrics', {}).get('enabled', True):
-            val_engine = compute_engine_metrics(
-                val_units, val_cycles, val_rul, y_val, val_pred
-            )
-            test_engine = compute_engine_metrics(
-                test_units, test_cycles, test_rul, y_test, test_pred
-            )
-            val_engine_path = export_engine_metrics_csv(
-                val_engine,
-                os.path.join(self.config['paths']['results_dir'],
-                             'engine_metrics_validation.csv'),
-            )
-            test_engine_path = export_engine_metrics_csv(
-                test_engine,
-                os.path.join(self.config['paths']['results_dir'],
-                             'engine_metrics_test.csv'),
-            )
-            engine_metrics = {
-                'validation': {**val_engine, 'csv_path': val_engine_path},
-                'test': {**test_engine, 'csv_path': test_engine_path},
-            }
-            self.logger.info(
-                "Engine metrics (test): %s", test_engine['summary']
-            )
+        engine_metrics = {
+            'validation': self._engine_metrics(
+                splits['val_units'], splits['val_cycles'], splits['val_rul'],
+                splits['y_val'], val_pred, suffix=f'{suffix}_validation',
+            ),
+            'test': self._engine_metrics(
+                splits['test_units'], splits['test_cycles'], splits['test_rul'],
+                splits['y_test'], test_pred, suffix=f'{suffix}_test',
+            ),
+        }
+        alerting = self._alerting_report(
+            splits['y_test'], test_scores, splits['test_units'],
+            splits['test_cycles'], splits['test_rul'], threshold,
+            suffix=suffix,
+        )
+        self.logger.info(
+            "%s validation metrics: %s", architecture, validation_metrics
+        )
+        self.logger.info("%s test metrics: %s", architecture, test_metrics)
+        return {
+            'architecture': architecture,
+            'model_path': model_path,
+            'feature_count': int(prepared['X_train'].shape[1]),
+            'calibration': calibration_info,
+            'calibration_report': calibration_report,
+            'decision_threshold': threshold_report,
+            'decision_threshold_path': threshold_path,
+            'validation_metrics': validation_metrics,
+            'test_metrics': test_metrics,
+            'engine_metrics': engine_metrics,
+            'alerting': alerting,
+            'rul_regression': prepared['rul_report'],
+            'feature_metadata_path': (
+                prepared['paths']['feature_metadata']
+                if prepared['uses_temporal_features'] else None
+            ),
+            'training_seconds': float(training_seconds),
+            'inference_seconds': float(inference_seconds),
+            'val_scores': val_scores,
+            'test_scores': test_scores,
+            'threshold': threshold,
+        }
+
+    def _collect_fusion_signals(self, X_raw: np.ndarray,
+                                neural_scores: np.ndarray,
+                                predicted_rul: Optional[np.ndarray],
+                                label: str) -> np.ndarray:
+        """Reason over every window and build the logistic-fusion matrix."""
+        reasoner = self._initialise_reasoner()
+        with open(PROB_RULES_PATH, 'r') as file:
+            problog_program = file.read()
+        symbolic_scores = np.zeros(len(X_raw), dtype=float)
+        problog_risks = np.zeros(len(X_raw), dtype=float)
+        problog_config = self.config.get('problog', {})
+        problog_logger = logging.getLogger('problog')
+        previous_problog_level = problog_logger.level
+        problog_logger.setLevel(logging.WARNING)
+        try:
+            for index, window in enumerate(X_raw):
+                sensor_dict = {
+                    name: float(window[-1, feature_index])
+                    for feature_index, name in enumerate(self.feature_names)
+                }
+                reasoner.state_history = []
+                insights = reasoner.reason(sensor_dict, window=window)
+                symbolic_scores[index] = symbolic_rule_score(insights)
+                problog = evaluate_state(
+                    problog_program, sensor_dict,
+                    learned_rules=reasoner.get_active_learned_rule_names(),
+                    learned_rule_weight=float(
+                        problog_config.get('learned_rule_weight', 0.15)
+                    ),
+                    max_active_learned_rules=int(
+                        problog_config.get('max_active_learned_rules', 3)
+                    ),
+                )
+                problog_risks[index] = float(problog['failure_risk'])
+                if (index + 1) % 1000 == 0:
+                    self.logger.info(
+                        "Fusion signals %s: %d/%d windows", label,
+                        index + 1, len(X_raw),
+                    )
+        finally:
+            problog_logger.setLevel(previous_problog_level)
+        if predicted_rul is None:
+            predicted_rul = np.zeros(len(X_raw), dtype=float)
+        fusion_config = self.config.get('fusion', {})
+        return ProbabilityFusion.build_matrix(
+            neural_scores, symbolic_scores, problog_risks,
+            predicted_rul,
+            feature_order=fusion_config.get(
+                'features',
+                [
+                    'neural_probability', 'symbolic_rule_score',
+                    'problog_failure_risk', 'predicted_rul',
+                ],
+            ),
+        )
+
+    def _apply_fusion(self, prepared: Dict[str, Any],
+                      splits: Dict[str, Any],
+                      neural_val_scores: np.ndarray,
+                      neural_test_scores: np.ndarray,
+                      neural_threshold: float) -> Dict[str, Any]:
+        """Fit validation-only fusion and return fused scores and metrics."""
+        fusion_config = self.config.get('fusion', {})
+        if not self._applies_to(
+                fusion_config, prepared['architecture']):
+            return {'enabled': False, 'applied': False}
+
+        val_matrix = self._collect_fusion_signals(
+            splits['X_val'], neural_val_scores,
+            prepared['rul_report'].get('validation_predictions'),
+            'validation',
+        )
+        test_matrix = self._collect_fusion_signals(
+            splits['X_test'], neural_test_scores,
+            prepared['rul_report'].get('test_predictions'),
+            'test',
+        )
+        fusion = ProbabilityFusion(
+            random_state=int(self.config['model'].get('random_state', 42)),
+            feature_order=fusion_config.get(
+                'features',
+                [
+                    'neural_probability', 'symbolic_rule_score',
+                    'problog_failure_risk', 'predicted_rul',
+                ],
+            ),
+            logger=self.logger,
+        )
+        fusion.fit(val_matrix, splits['y_val'])
+        val_fused = fusion.positive_proba(val_matrix)
+        test_fused = fusion.positive_proba(test_matrix)
+        fusion_selection = select_threshold(
+            splits['y_val'], val_fused,
+            strategy=fusion_config.get('threshold_strategy', 'recall_at_precision'),
+            min_precision=float(fusion_config.get('min_precision', 0.75)),
+            beta=float(fusion_config.get('beta', 2.0)),
+            fallback=float(fusion_config.get('fallback', 0.5)),
+        )
+        fusion_threshold = float(fusion_selection['threshold'])
+        val_pred = (val_fused >= fusion_threshold).astype(int)
+        test_pred = (test_fused >= fusion_threshold).astype(int)
+        fusion_model_path = os.path.join(
+            self.config['paths']['results_dir'], 'models',
+            'probability_fusion.joblib',
+        )
+        fusion.save(fusion_model_path)
+        threshold_path = os.path.join(
+            self.config['paths']['results_dir'], 'fusion_threshold.json'
+        )
+        with open(threshold_path, 'w') as file:
+            json.dump(fusion_selection, file, indent=2, cls=NumpyEncoder)
+        report = {
+            'enabled': True,
+            'applied': True,
+            'trained_on': 'validation_split_only',
+            'features': fusion.feature_order,
+            'coefficients': fusion.coefficients(),
+            'model_path': fusion_model_path,
+            'threshold_path': threshold_path,
+            'threshold': fusion_threshold,
+            'threshold_strategy': fusion_selection['strategy'],
+            'validation_metrics': self._compute_metrics(
+                splits['y_val'], val_pred, val_fused
+            ),
+            'test_metrics': self._compute_metrics(
+                splits['y_test'], test_pred, test_fused
+            ),
+            'validation_calibration': evaluate_probability_fusion(
+                splits['y_val'], val_fused
+            ),
+            'test_calibration': evaluate_probability_fusion(
+                splits['y_test'], test_fused
+            ),
+            'neural_threshold': float(neural_threshold),
+            'val_scores': val_fused,
+            'test_scores': test_fused,
+        }
+        self.logger.info(
+            "Fusion validation metrics: %s", report['validation_metrics']
+        )
+        self.logger.info("Fusion test metrics: %s", report['test_metrics'])
+        return report
+
+    def _run_cmapss(self) -> Dict[str, Any]:
+        """Train and evaluate the FD001 model with an engine-level split."""
+        self.logger.info("Starting C-MAPSS pipeline.")
+        splits = self._load_cmapss_splits()
+        architecture = self._normalise_architecture(
+            self.config.get('model', {}).get('architecture', 'random_forest')
+        )
+        prepared = self._prepare_model_data(splits, architecture)
+        evaluation = self._evaluate_architecture(prepared, splits)
+        val_scores = evaluation['val_scores']
+        test_scores = evaluation['test_scores']
+        calibration_info = evaluation['calibration']
+        calibration_report = evaluation['calibration_report']
+        threshold_report = evaluation['decision_threshold']
+        threshold_path = evaluation['decision_threshold_path']
+        validation_metrics = evaluation['validation_metrics']
+        test_metrics = evaluation['test_metrics']
+        engine_metrics = evaluation['engine_metrics']
+        model_path = evaluation['model_path']
+        scaler_path = (
+            os.path.join(self.config['paths']['results_dir'], 'scaler.pkl')
+            if prepared['scaler'] is not None else None
+        )
+        decision_threshold = evaluation['threshold']
 
         temporal_config = self.config.get('temporal', {})
         temporal_path = None
@@ -669,7 +1311,7 @@ class ANSRDTPipeline:
             reasoner = self._initialise_reasoner()
             sensor_thresholds = reasoner.get_sensor_thresholds()
             self.temporal_thresholds = compute_temporal_thresholds(
-                X_train, self.feature_names,
+                splits['X_train'], self.feature_names,
                 high_thresholds=sensor_thresholds.get('high', {}),
                 low_thresholds=sensor_thresholds.get('low', {}),
                 percentile=float(temporal_config.get('percentile', 75)),
@@ -688,6 +1330,37 @@ class ANSRDTPipeline:
                 temporal_path,
             )
 
+        fusion = self._apply_fusion(
+            prepared, splits, val_scores, test_scores, decision_threshold
+        )
+        if fusion.get('applied'):
+            val_scores = fusion['val_scores']
+            test_scores = fusion['test_scores']
+            decision_threshold = fusion['threshold']
+            validation_metrics = fusion['validation_metrics']
+            test_metrics = fusion['test_metrics']
+            val_pred = (val_scores >= decision_threshold).astype(int)
+            test_pred = (test_scores >= decision_threshold).astype(int)
+            engine_metrics = {
+                'validation': self._engine_metrics(
+                    splits['val_units'], splits['val_cycles'],
+                    splits['val_rul'], splits['y_val'], val_pred,
+                    suffix='_fusion_validation',
+                ),
+                'test': self._engine_metrics(
+                    splits['test_units'], splits['test_cycles'],
+                    splits['test_rul'], splits['y_test'], test_pred,
+                    suffix='_fusion_test',
+                ),
+            }
+            alerting = self._alerting_report(
+                splits['y_test'], test_scores, splits['test_units'],
+                splits['test_cycles'], splits['test_rul'],
+                decision_threshold, suffix='_fusion',
+            )
+        else:
+            alerting = evaluation['alerting']
+
         rule_validation = None
         rule_validation_path = None
         rule_validation_config = self.config.get('hitl', {}).get(
@@ -696,7 +1369,7 @@ class ANSRDTPipeline:
         if rule_validation_config.get('enabled', True):
             reasoner = self._initialise_reasoner()
             rule_validation = reasoner.validate_learned_rules(
-                X_val, self.feature_names, y_val,
+                splits['X_val'], self.feature_names, splits['y_val'],
                 min_precision=float(
                     rule_validation_config.get('min_precision', 0.9)
                 ),
@@ -718,31 +1391,69 @@ class ANSRDTPipeline:
                 "Learned-rule validation: %s", rule_validation['summary']
             )
 
-        explanations = self._explain_representative_windows(X_test, test_scores)
-        hitl_queue = self._build_hitl_queue(X_test, test_scores)
+        explanations = self._explain_representative_windows(
+            splits['X_test'], test_scores, decision_threshold
+        )
+        hitl_queue = self._build_hitl_queue(
+            splits['X_test'], test_scores, decision_threshold
+        )
+        if fusion.get('applied'):
+            decision_section = {
+                'source': 'probability_fusion',
+                'threshold': fusion['threshold'],
+                'strategy': fusion['threshold_strategy'],
+                'path': fusion['threshold_path'],
+                'neural_threshold': fusion['neural_threshold'],
+                'neural_decision': {
+                    **threshold_report, 'path': threshold_path,
+                },
+            }
+            primary_threshold_path = fusion['threshold_path']
+        else:
+            decision_section = {
+                'source': prepared['architecture'],
+                **threshold_report,
+                'path': threshold_path,
+            }
+            primary_threshold_path = threshold_path
+
+        fusion_report = {
+            key: value for key, value in fusion.items()
+            if key not in {'val_scores', 'test_scores'}
+        }
+        rul_report = {
+            key: value for key, value in prepared['rul_report'].items()
+            if key not in {'validation_predictions', 'test_predictions'}
+        }
+
         results = {
             'dataset': 'NASA C-MAPSS FD001',
-            'test_source': test_source,
+            'architecture': prepared['architecture'],
+            'test_source': splits['test_source'],
             'data_file': self.config['paths']['data_file'],
             'splits': {
-                'train_windows': int(len(X_train)),
-                'validation_windows': int(len(X_val)),
-                'test_windows': int(len(X_test)),
-                'train_positive_rate': float(np.mean(y_train)),
-                'validation_positive_rate': float(np.mean(y_val)),
-                'test_positive_rate': float(np.mean(y_test)),
+                'train_windows': int(len(splits['X_train'])),
+                'validation_windows': int(len(splits['X_val'])),
+                'test_windows': int(len(splits['X_test'])),
+                'train_positive_rate': float(np.mean(splits['y_train'])),
+                'validation_positive_rate': float(np.mean(splits['y_val'])),
+                'test_positive_rate': float(np.mean(splits['y_test'])),
             },
             'metrics': {
                 'validation': validation_metrics,
                 'test': test_metrics,
             },
+            'neural_metrics': {
+                'validation': evaluation['validation_metrics'],
+                'test': evaluation['test_metrics'],
+            },
+            'decision_threshold': decision_section,
+            'probability_fusion': fusion_report,
+            'rul_regression': rul_report,
+            'alerting': alerting,
             'calibration': {
                 **calibration_info,
                 'metrics': calibration_report,
-            },
-            'decision_threshold': {
-                **threshold_report,
-                'path': threshold_path,
             },
             'engine_metrics': engine_metrics,
             'hitl_rule_validation': rule_validation,
@@ -751,10 +1462,24 @@ class ANSRDTPipeline:
             'artifacts': {
                 'model_path': model_path,
                 'scaler_path': scaler_path,
+                'feature_extractor_path': (
+                    prepared['paths']['feature_extractor']
+                    if prepared['uses_temporal_features'] else None
+                ),
+                'feature_metadata_path': (
+                    prepared['paths']['feature_metadata']
+                    if prepared['uses_temporal_features'] else None
+                ),
+                'rul_regressor_path': (
+                    prepared['paths']['rul_regressor']
+                    if prepared['rul_report'].get('applied') else None
+                ),
+                'fusion_model_path': fusion.get('model_path'),
                 'problog_rules_path': PROB_RULES_PATH,
                 'calibration_report_path': calibration_report.get('report_path'),
-                'decision_threshold_path': threshold_path,
+                'decision_threshold_path': primary_threshold_path,
                 'temporal_thresholds_path': temporal_path,
+                'alerting_report_path': alerting.get('report_path'),
                 'hitl_rule_validation_path': rule_validation_path,
                 'hitl_queue_csv': hitl_queue.get('csv_path'),
                 'hitl_queue_json': hitl_queue.get('json_path'),
@@ -767,6 +1492,117 @@ class ANSRDTPipeline:
             json.dump(results, file, indent=2, cls=NumpyEncoder)
         self.logger.info("C-MAPSS results saved to %s", results_path)
         return results
+
+    def _selection_score(self, metrics: Dict[str, Any]) -> float:
+        """Return the configured validation-only model-selection score."""
+        compare_config = self.config.get('experiments', {}).get(
+            'compare_models', {}
+        )
+        metric = compare_config.get('selection_metric', 'fbeta')
+        precision = float(metrics.get('precision') or 0.0)
+        recall = float(metrics.get('recall') or 0.0)
+        if metric == 'fbeta':
+            beta = float(compare_config.get('beta', 2.0))
+            beta_sq = beta * beta
+            denominator = beta_sq * precision + recall
+            return (
+                (1.0 + beta_sq) * precision * recall / denominator
+                if denominator else 0.0
+            )
+        if metric == 'average_precision':
+            return float(metrics.get('average_precision') or 0.0)
+        if metric == 'roc_auc':
+            return float(metrics.get('roc_auc') or 0.0)
+        return float(metrics.get(metric) or 0.0)
+
+    def _run_model_comparison(self) -> Dict[str, Any]:
+        """Compare configured architectures using validation-only selection."""
+        self.logger.info("Starting model comparison.")
+        compare_config = self.config.get('experiments', {}).get(
+            'compare_models', {}
+        )
+        architectures = [
+            self._normalise_architecture(name)
+            for name in compare_config.get(
+                'models', ['random_forest', 'lightgbm']
+            )
+        ]
+        splits = self._load_cmapss_splits()
+        comparison = {}
+        for architecture in architectures:
+            suffix = f'_{architecture}'
+            prepared = self._prepare_model_data(
+                splits, architecture, suffix=suffix
+            )
+            evaluation = self._evaluate_architecture(
+                prepared, splits, suffix=suffix
+            )
+            comparison[architecture] = {
+                'architecture': architecture,
+                'model_path': evaluation['model_path'],
+                'feature_count': evaluation['feature_count'],
+                'validation_metrics': evaluation['validation_metrics'],
+                'test_metrics': evaluation['test_metrics'],
+                'calibration_method': evaluation['calibration'].get('method'),
+                'calibration_candidates': evaluation['calibration'].get(
+                    'candidates', []
+                ),
+                'decision_threshold': evaluation['threshold'],
+                'engine_metrics': {
+                    split: details.get('summary', {})
+                    for split, details in evaluation['engine_metrics'].items()
+                },
+                'alerting': evaluation['alerting'].get('modes', {}),
+                'rul_regression': {
+                    key: value for key, value in
+                    evaluation['rul_regression'].items()
+                    if key not in {
+                        'validation_predictions', 'test_predictions'
+                    }
+                },
+                'training_seconds': evaluation['training_seconds'],
+                'inference_seconds': evaluation['inference_seconds'],
+                'validation_selection_score': self._selection_score(
+                    evaluation['validation_metrics']
+                ),
+            }
+            self.logger.info(
+                "Comparison %s: validation score=%.4f test F1=%.4f",
+                architecture,
+                comparison[architecture]['validation_selection_score'],
+                float(evaluation['test_metrics'].get('f1') or 0.0),
+            )
+
+        selected = max(
+            comparison,
+            key=lambda name: comparison[name]['validation_selection_score'],
+        )
+        report = {
+            'dataset': 'NASA C-MAPSS FD001',
+            'selection_metric': compare_config.get(
+                'selection_metric', 'fbeta'
+            ),
+            'selection_beta': compare_config.get('beta', 2.0),
+            'selection_split': 'validation',
+            'selected_model': selected,
+            'models': comparison,
+            'splits': {
+                'train_windows': int(len(splits['X_train'])),
+                'validation_windows': int(len(splits['X_val'])),
+                'test_windows': int(len(splits['X_test'])),
+            },
+            'timestamp': datetime.now().isoformat(),
+        }
+        path = os.path.join(
+            self.config['paths']['results_dir'], 'model_comparison.json'
+        )
+        with open(path, 'w') as file:
+            json.dump(report, file, indent=2, cls=NumpyEncoder)
+        report['report_path'] = path
+        self.logger.info(
+            "Model comparison saved to %s; selected=%s", path, selected
+        )
+        return report
 
     def _run_legacy(self) -> Dict[str, Any]:
         """Run the original synthetic-data path for backward compatibility."""
@@ -820,12 +1656,20 @@ class ANSRDTPipeline:
         }
         return results
 
-    def run(self) -> Dict[str, Any]:
+    def run(self, compare_models: Optional[bool] = None) -> Dict[str, Any]:
         """Execute the configured pipeline and return a run summary."""
         try:
-            if self.is_cmapss:
-                return self._run_cmapss()
-            return self._run_legacy()
+            if not self.is_cmapss:
+                return self._run_legacy()
+            if compare_models is None:
+                compare_models = bool(
+                    self.config.get('experiments', {}).get(
+                        'compare_models', {}
+                    ).get('enabled', False)
+                )
+            if compare_models:
+                return self._run_model_comparison()
+            return self._run_cmapss()
         except Exception as e:
             self.logger.exception(f"ANSR-DT pipeline failed: {e}")
             raise

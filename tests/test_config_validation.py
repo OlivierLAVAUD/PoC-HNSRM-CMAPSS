@@ -91,6 +91,70 @@ class TestConfigValidation(unittest.TestCase):
         with self.assertRaises(ValueError):
             validate_config(config, self.logger, '/tmp/project', '/tmp/project/configs')
 
+    def test_accepts_auto_calibration_and_valid_extensions(self):
+        config = self._minimal_config()
+        config['calibration'] = {'enabled': True, 'method': 'auto'}
+        config['features'] = {
+            'temporal': {
+                'enabled': True, 'percentile_low': 25, 'percentile_high': 75,
+                'apply_to_architectures': ['lightgbm'],
+            },
+        }
+        config['alerting'] = {
+            'enabled': True, 'consecutive_ks': [2, 3], 'smoothing_cycles': 3,
+        }
+        config['experiments'] = {
+            'compare_models': {
+                'enabled': True,
+                'models': ['random_forest', 'lightgbm'],
+                'selection_metric': 'fbeta',
+                'selection_split': 'validation',
+            },
+        }
+        with tempfile.TemporaryDirectory() as tmpdir:
+            config_dir = os.path.join(tmpdir, 'configs')
+            data_dir = os.path.join(tmpdir, 'data', 'raw', 'CMAPSS')
+            reasoning_dir = os.path.join(tmpdir, 'src', 'reasoning')
+            os.makedirs(config_dir, exist_ok=True)
+            os.makedirs(data_dir, exist_ok=True)
+            os.makedirs(reasoning_dir, exist_ok=True)
+            open(os.path.join(data_dir, 'FD001_processed.parquet'), 'a').close()
+            open(os.path.join(reasoning_dir, 'rules.pl'), 'a').close()
+            validate_config(config, self.logger, tmpdir, config_dir)
+
+    def test_rejects_test_split_model_selection(self):
+        config = self._minimal_config()
+        config['experiments'] = {
+            'compare_models': {
+                'enabled': True,
+                'models': ['random_forest', 'lightgbm'],
+                'selection_split': 'test',
+            },
+        }
+        with self.assertRaises(ValueError):
+            validate_config(
+                config, self.logger, '/tmp/project', '/tmp/project/configs'
+            )
+
+    def test_rejects_invalid_temporal_thresholds_and_alerting(self):
+        config = self._minimal_config()
+        config['features'] = {
+            'temporal': {
+                'enabled': True, 'percentile_low': 80, 'percentile_high': 20,
+            },
+        }
+        with self.assertRaises(ValueError):
+            validate_config(
+                config, self.logger, '/tmp/project', '/tmp/project/configs'
+            )
+
+        config = self._minimal_config()
+        config['alerting'] = {'enabled': True, 'consecutive_ks': [0]}
+        with self.assertRaises(ValueError):
+            validate_config(
+                config, self.logger, '/tmp/project', '/tmp/project/configs'
+            )
+
     def test_validate_config_missing_key(self):
         config = {
             'model': {},

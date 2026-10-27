@@ -28,13 +28,25 @@ model:
     n_estimators: 100
     max_depth: 10
     class_weight: "balanced"
+  # Complementary gradient-boosting architecture. Select it with
+  # model.architecture: "lightgbm" or `python main.py --architecture lightgbm`.
+  lightgbm:
+    n_estimators: 350
+    learning_rate: 0.05
+    num_leaves: 31
+    max_depth: -1
+    min_child_samples: 20
+    subsample: 0.9
+    colsample_bytree: 0.9
+    reg_lambda: 0.0
+    class_weight: "balanced"
 
 # ===============================
 # Probability Calibration
 # ===============================
 calibration:
   enabled: true
-  method: "sigmoid"       # sigmoid (small/imbalanced) or isotonic
+  method: "auto"          # auto | sigmoid | isotonic (auto uses validation Brier)
   cv_folds: 5
   n_bins: 10
 
@@ -110,6 +122,67 @@ temporal:
   enabled: true
   percentile: 75.0                # training-only threshold percentile
   moving_average_cycles: 5
+
+# ===============================
+# Explicit Temporal Features (LightGBM)
+# ===============================
+features:
+  temporal:
+    enabled: true
+    include_raw_window: true
+    moving_average_cycles: 5
+    percentile_low: 25.0
+    percentile_high: 75.0
+    apply_to_architectures: ["lightgbm"]
+
+# ===============================
+# Controlled Model Comparison
+# ===============================
+experiments:
+  compare_models:
+    enabled: false                 # enable with `python main.py --compare-models`
+    models: ["random_forest", "lightgbm"]
+    selection_metric: "fbeta"      # f1 | fbeta | recall | average_precision | roc_auc
+    beta: 2.0
+    selection_split: validation
+
+# ===============================
+# Alert Confirmation and Smoothing
+# ===============================
+alerting:
+  enabled: true
+  consecutive_ks: [2, 3]
+  smoothing_cycles: 3
+
+# ===============================
+# Auxiliary RUL Regression
+# ===============================
+rul_regression:
+  enabled: true
+  apply_to_architectures: ["lightgbm"]
+  use_as_classifier_feature: true
+  cv_folds: 5
+  n_estimators: 300
+  learning_rate: 0.05
+  num_leaves: 31
+  max_depth: -1
+  min_child_samples: 20
+  subsample: 0.9
+  colsample_bytree: 0.9
+  reg_lambda: 0.0
+
+# ===============================
+# Validation-only Probability Fusion
+# ===============================
+fusion:
+  enabled: true
+  apply_to_architectures: ["lightgbm"]
+  threshold_strategy: "recall_at_precision"
+  min_precision: 0.75
+  beta: 2.0
+  fallback: 0.5
+  features: ["neural_probability", "symbolic_rule_score",
+             "problog_failure_risk", "predicted_rul"]
 
 # ===============================
 # Engine-level Evaluation
