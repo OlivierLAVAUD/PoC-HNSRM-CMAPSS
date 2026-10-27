@@ -250,7 +250,3 @@ S. B. Hakim, M. Adil, A. Velasquez and H. H. Song, "An Explainable Neuro-Symboli
 ## License
 
 This project is licensed under the MIT License. See [LICENSE](LICENSE).
-
-## Contact
-
-Please open an issue for project questions or contact Safayat Bin Hakim at `safayat DOT b DOT hakim AT gmail DOT com`.
