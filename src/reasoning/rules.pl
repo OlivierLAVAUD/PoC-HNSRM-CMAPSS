@@ -1,6 +1,8 @@
 %% src/reasoning/rules.pl - HPC degradation rules for C-MAPSS FD001
 %%
-%% Thresholds are derived from training-set percentiles (no test leakage):
+%% Thresholds are derived from the 20 training engines selected by the
+%% pipeline's 20/20/60 unit split (random_state=42), before any validation or
+%% held-out engine is seen:
 %%   - "elevated" / "high"  : 75th percentile for early warning
 %%   - "critical"           : 95th percentile for severe degradation
 %%   - "low"                : 25th percentile for reversed indicators
@@ -40,39 +42,51 @@ sensor_direction(s17, higher_worse).
 sensor_direction(s20, lower_worse).
 sensor_direction(s21, lower_worse).
 
-% 95th percentile of the FD001 training split.
-sensor_high_threshold(s2, 643.580).
-sensor_high_threshold(s3, 1601.470).
-sensor_high_threshold(s4, 1425.670).
+% 95th percentile of the 20 FD001 training engines.
+sensor_high_threshold(s2, 643.590).
+sensor_high_threshold(s3, 1601.330).
+sensor_high_threshold(s4, 1426.015).
 sensor_high_threshold(s8, 2388.220).
-sensor_high_threshold(s9, 9109.980).
-sensor_high_threshold(s11, 48.045).
+sensor_high_threshold(s9, 9105.077).
+sensor_high_threshold(s11, 48.050).
 sensor_high_threshold(s13, 2388.230).
-sensor_high_threshold(s14, 8181.405).
-sensor_high_threshold(s15, 8.511).
+sensor_high_threshold(s14, 8178.803).
+sensor_high_threshold(s15, 8.510).
 sensor_high_threshold(s17, 396.000).
 
-% 5th percentile of the FD001 training split.
-sensor_low_threshold(s7, 551.740).
-sensor_low_threshold(s12, 520.040).
+% 5th percentile of the 20 FD001 training engines.
+sensor_low_threshold(s7, 551.710).
+sensor_low_threshold(s12, 520.021).
 sensor_low_threshold(s20, 38.490).
 sensor_low_threshold(s21, 23.093).
 
-% 95th percentile of absolute cycle-to-cycle change (rule extraction only).
-gradient_threshold(s2, 0.830).
-gradient_threshold(s3, 11.030).
-gradient_threshold(s4, 11.190).
-gradient_threshold(s7, 1.130).
+% Named HPC rule thresholds. This block is the single source of truth for the
+% six degradation rules below; src/reasoning/prob_query.py reads these facts.
+% elevated / high = 75th percentile, critical = 95th percentile, low = 25th,
+% measured on the 20 training engines.
+hpc_rule_threshold(s4, elevated, 1414.993).
+hpc_rule_threshold(s4, critical, 1426.015).
+hpc_rule_threshold(s11, high, 47.710).
+hpc_rule_threshold(s7, low, 552.777).
+hpc_rule_threshold(s12, low, 520.930).
+hpc_rule_threshold(s21, low, 23.218).
+
+% 95th percentile of absolute cycle-to-cycle change on the 20 training
+% engines (rule extraction only).
+gradient_threshold(s2, 0.810).
+gradient_threshold(s3, 11.018).
+gradient_threshold(s4, 11.047).
+gradient_threshold(s7, 1.138).
 gradient_threshold(s8, 0.080).
-gradient_threshold(s9, 11.605).
+gradient_threshold(s9, 11.518).
 gradient_threshold(s11, 0.280).
-gradient_threshold(s12, 0.830).
+gradient_threshold(s12, 0.840).
 gradient_threshold(s13, 0.080).
-gradient_threshold(s14, 8.650).
+gradient_threshold(s14, 8.558).
 gradient_threshold(s15, 0.056).
 gradient_threshold(s17, 3.000).
 gradient_threshold(s20, 0.280).
-gradient_threshold(s21, 0.167).
+gradient_threshold(s21, 0.166).
 
 % ---------------------------------------------------------------------------
 % Generic predicates used by neural rule extraction
@@ -108,32 +122,38 @@ trend(Sensor, decreasing) :-
 %% s4 (T50, LPT outlet temperature) above the 75th percentile.
 hpc_temp_elevated :-
     current_sensor_value(s4, Value),
-    Value > 1414.555.
+    hpc_rule_threshold(s4, elevated, Threshold),
+    Value > Threshold.
 
 %% s4 (T50) above the 95th percentile.
 hpc_temp_critical :-
     current_sensor_value(s4, Value),
-    Value > 1425.670.
+    hpc_rule_threshold(s4, critical, Threshold),
+    Value > Threshold.
 
 %% s11 (Ps30, HPC outlet static pressure) above the 75th percentile.
 hpc_static_pressure_high :-
     current_sensor_value(s11, Value),
-    Value > 47.700.
+    hpc_rule_threshold(s11, high, Threshold),
+    Value > Threshold.
 
 %% s7 (P30, HPC outlet pressure) below the 25th percentile.
 hpc_outlet_pressure_low :-
     current_sensor_value(s7, Value),
-    Value < 552.810.
+    hpc_rule_threshold(s7, low, Threshold),
+    Value < Threshold.
 
 %% s12 (phi, fuel flow ratio) below the 25th percentile.
 fuel_flow_low :-
     current_sensor_value(s12, Value),
-    Value < 520.960.
+    hpc_rule_threshold(s12, low, Threshold),
+    Value < Threshold.
 
 %% s21 (W32, LPT coolant bleed) below the 25th percentile.
 coolant_bleed_low :-
     current_sensor_value(s21, Value),
-    Value < 23.222.
+    hpc_rule_threshold(s21, low, Threshold),
+    Value < Threshold.
 
 %% Combined HPC degradation signature.
 hpc_degradation_pattern :-

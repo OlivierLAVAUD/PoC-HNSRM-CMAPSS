@@ -29,6 +29,13 @@ coolant_bleed_low :- fail.
 0.75::failure_risk :- hpc_degradation.
 0.85::failure_risk :- critical_temp_ratio, high_pressure_ratio, low_coolant_ratio.
 0.60::failure_risk :- high_temp_ratio, low_fuel_flow_ratio.
+% Pressure/flow pathway: high static pressure, low outlet pressure and low
+% fuel flow also indicate HPC degradation when the outlet temperature is not
+% elevated, so that state must not report a zero failure risk.
+0.60::failure_risk :-
+    high_pressure_ratio,
+    low_outlet_pressure_ratio,
+    low_fuel_flow_ratio.
 
 query(failure_risk).
 query(hpc_degradation).

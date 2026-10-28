@@ -11,7 +11,7 @@ import unittest
 from src.hitl.feedback import FeedbackRecorder
 from src.hitl.queue import HITLQueue
 from src.reasoning.prob_query import EXAMPLES, RULES_PATH, evaluate_state
-from src.reasoning.reasoning import SymbolicReasoner
+from src.reasoning.reasoning import PYSWIP_AVAILABLE, SymbolicReasoner
 
 
 class TestHITLQueueAndFeedback(unittest.TestCase):
@@ -75,6 +75,7 @@ class TestHITLQueueAndFeedback(unittest.TestCase):
         self.assertEqual(loaded.cases[-1].case_id, 'case_0005')
         self.assertEqual(loaded.cases[0].sensor_values['s4'], EXAMPLES['critical']['s4'])
 
+    @unittest.skipUnless(PYSWIP_AVAILABLE, "SWI-Prolog/PySWIP not available")
     def test_feedback_updates_queue_log_and_learned_rules(self):
         logger = logging.getLogger('TestHITL')
         logger.addHandler(logging.NullHandler())

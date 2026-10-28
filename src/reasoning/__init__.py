@@ -1,7 +1,7 @@
 # src/reasoning/__init__.py
+"""Symbolic and probabilistic reasoning helpers.
 
-from .reasoning import SymbolicReasoner
-from .rule_learning import RuleLearner
-from .state_tracker import StateTracker
-
-__all__ = ['SymbolicReasoner', 'RuleLearner', 'StateTracker']
+Import ``SymbolicReasoner`` from ``src.reasoning.reasoning`` directly; keeping
+this package initializer light avoids a PySWIP/SWI-Prolog dependency for
+modules that only need temporal features or ProbLog.
+"""

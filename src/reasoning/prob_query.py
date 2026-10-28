@@ -16,17 +16,31 @@ RULES_PATH = os.path.join(SCRIPT_DIR, 'prob_rules.pl')
 LOG_DIR = os.path.join(PROJECT_ROOT, 'logs')
 RESULTS_DIR = os.path.join(PROJECT_ROOT, 'results')
 
-# Thresholds mirror src/reasoning/rules.pl and come from FD001 training percentiles.
-# elevated / high = 75th percentile, critical = 95th percentile,
-# low = 25th percentile.
-THRESHOLDS = {
-    's4_elevated': 1414.555,
-    's4_critical': 1425.670,
-    's11_high': 47.700,
-    's7_low': 552.810,
-    's12_low': 520.960,
-    's21_low': 23.222,
-}
+# Named HPC thresholds are read from rules.pl, which is the single source of
+# truth (elevated / high = 75th percentile, critical = 95th, low = 25th).
+RULES_PL_PATH = os.path.join(SCRIPT_DIR, 'rules.pl')
+_THRESHOLD_PATTERN = re.compile(
+    r"hpc_rule_threshold\(\s*([a-z][a-z0-9_]*)\s*,\s*"
+    r"([a-z][a-z0-9_]*)\s*,\s*"
+    r"([-+]?(?:\d+\.?\d*|\.\d+)(?:[eE][-+]?\d+)?)\s*\)\s*\."
+)
+
+
+def load_hpc_thresholds(path: str = RULES_PL_PATH) -> dict:
+    """Read the named HPC thresholds declared in a Prolog rule file."""
+    thresholds = {}
+    with open(path, 'r') as file:
+        for line in file:
+            if line.lstrip().startswith('%'):
+                continue
+            for sensor, kind, value in _THRESHOLD_PATTERN.findall(line):
+                thresholds[f'{sensor}_{kind}'] = float(value)
+    if not thresholds:
+        raise ValueError(f"No hpc_rule_threshold facts found in {path}")
+    return thresholds
+
+
+THRESHOLDS = load_hpc_thresholds()
 
 EXAMPLES = {
     'normal': {

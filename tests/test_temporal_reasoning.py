@@ -9,7 +9,7 @@ import unittest
 import numpy as np
 
 from src.reasoning.prob_query import EXAMPLES
-from src.reasoning.reasoning import SymbolicReasoner
+from src.reasoning.reasoning import PYSWIP_AVAILABLE, SymbolicReasoner
 from src.reasoning.temporal import compute_temporal_thresholds, window_temporal_features
 
 FEATURES = list(EXAMPLES['normal'].keys())
@@ -27,6 +27,7 @@ def _temporal_window():
     return window
 
 
+@unittest.skipUnless(PYSWIP_AVAILABLE, "SWI-Prolog/PySWIP not available")
 class TestTemporalReasoning(unittest.TestCase):
     def setUp(self):
         self.temp_dir = tempfile.mkdtemp(prefix='ansrdt_temporal_')

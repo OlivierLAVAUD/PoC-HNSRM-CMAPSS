@@ -1,4 +1,2 @@
-from .evaluation import evaluate_model
-from .pattern_metrics import PatternEvaluator
-
-__all__ = ['evaluate_model', 'PatternEvaluator']
+# src/evaluation/__init__.py
+"""Evaluation helpers for the lightweight ANSR-DT pipeline."""

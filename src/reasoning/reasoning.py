@@ -1,16 +1,26 @@
 # src/reasoning/reasoning.py
 
 import logging
-from pyswip import Prolog
 import os
 import numpy as np
 from typing import Dict, List, Any, Tuple, Optional
-from .rule_learning import RuleLearner
-from .state_tracker import StateTracker
 from .temporal import window_temporal_features
 from datetime import datetime
 import math  # For isnan checks
 import re  # For parsing metadata and rule strings
+
+# PySWIP locates and loads SWI-Prolog at import time. Keeping that import
+# optional lets lightweight modules (and their tests) import this module on
+# machines without SWI-Prolog; only SymbolicReasoner instantiation needs it.
+try:
+    from pyswip import Prolog
+except Exception as _pyswip_error:  # ImportError or SwiPrologNotFoundError
+    Prolog = None
+    PYSWIP_AVAILABLE = False
+    PYSWIP_IMPORT_ERROR: Optional[Exception] = _pyswip_error
+else:
+    PYSWIP_AVAILABLE = True
+    PYSWIP_IMPORT_ERROR = None
 
 def _extract_rule_body(rule_string: str) -> Optional[str]:
     """Extract the body of a Prolog rule (everything after ':-' before trailing '.').
@@ -41,6 +51,11 @@ class SymbolicReasoner:
         and dynamically manages learned rules in a separate file.
         """
         self.logger = logger or logging.getLogger(__name__)
+        if Prolog is None:
+            raise RuntimeError(
+                "SymbolicReasoner requires SWI-Prolog and PySWIP, which are "
+                f"not available: {PYSWIP_IMPORT_ERROR}"
+            )
         try:
             self.prolog = Prolog()
             self.logger.info("PySWIP Prolog instance initialized.")
@@ -63,9 +78,6 @@ class SymbolicReasoner:
         self.state_history: List[Dict[str, Any]] = []
         self._sensor_thresholds: Dict[str, Dict[str, float]] = {}
         self._temporal_thresholds: Dict[str, Dict[str, float]] = {}
-
-        self.rule_learner = RuleLearner()
-        self.state_tracker = StateTracker()
 
         if not os.path.exists(self.rules_path):
             self.logger.error(f"Base Prolog rules file not found at: {self.rules_path}")

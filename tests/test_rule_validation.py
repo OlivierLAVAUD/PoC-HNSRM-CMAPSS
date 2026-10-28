@@ -9,7 +9,7 @@ import unittest
 import numpy as np
 
 from src.reasoning.prob_query import EXAMPLES
-from src.reasoning.reasoning import SymbolicReasoner
+from src.reasoning.reasoning import PYSWIP_AVAILABLE, SymbolicReasoner
 
 FEATURES = list(EXAMPLES['normal'].keys())
 
@@ -25,6 +25,7 @@ def _validation_windows():
     return X, y
 
 
+@unittest.skipUnless(PYSWIP_AVAILABLE, "SWI-Prolog/PySWIP not available")
 class TestRuleValidation(unittest.TestCase):
     def setUp(self):
         self.temp_dir = tempfile.mkdtemp(prefix='ansrdt_ruleval_')

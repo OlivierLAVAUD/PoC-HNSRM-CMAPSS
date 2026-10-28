@@ -1,11 +1,13 @@
 # src/pipeline/pipeline.py
 
+from __future__ import annotations
+
 import json
 import logging
 import os
 import time
 from datetime import datetime
-from typing import Any, Dict, Optional
+from typing import TYPE_CHECKING, Any, Dict, Optional
 
 import numpy as np
 from sklearn.metrics import (
@@ -45,9 +47,12 @@ from src.models.rul_regressor import (
 )
 from src.preprocessing.preprocessing import preprocess_sequences
 from src.reasoning.prob_query import RULES_PATH as PROB_RULES_PATH, evaluate_state
-from src.reasoning.reasoning import SymbolicReasoner
 from src.reasoning.temporal import compute_temporal_thresholds
+from src.reasoning.thresholds import verify_train_provenance
 from src.utils.model_utils import save_scaler
+
+if TYPE_CHECKING:
+    from src.reasoning.reasoning import SymbolicReasoner
 
 
 class NumpyEncoder(json.JSONEncoder):
@@ -359,6 +364,7 @@ class ANSRDTPipeline:
             feature_names=self.feature_names,
             test_file=self.config['paths'].get('test_file'),
             rul_file=self.config['paths'].get('rul_file'),
+            rul_threshold=int(self.config['training'].get('rul_threshold', 30)),
             logger=self.logger,
         )
         self.is_cmapss = isinstance(self.data_loader, CMAPSSLoader)
@@ -366,6 +372,9 @@ class ANSRDTPipeline:
         self.model: Optional[LightClassifier] = None
         self.reasoner: Optional[SymbolicReasoner] = None
         self.temporal_thresholds: Dict[str, Any] = {}
+        self.symbolic_enabled = bool(
+            self.config.get('symbolic_reasoning', {}).get('enabled', True)
+        )
 
     @staticmethod
     def _normalise_architecture(architecture: str) -> str:
@@ -430,6 +439,27 @@ class ANSRDTPipeline:
     def _split_scaled(scaler, X: np.ndarray) -> np.ndarray:
         """Apply a fitted scaler to a 3D window array."""
         return scaler.transform(X.reshape(-1, X.shape[-1])).reshape(X.shape)
+
+    def _sanitize_non_finite(self, X: np.ndarray, split: str) -> np.ndarray:
+        """Apply ``preprocessing.non_finite_policy`` to a window array."""
+        data = np.asarray(X, dtype=np.float32)
+        count = int((~np.isfinite(data)).sum())
+        if not count:
+            return data
+        policy = str(self.config.get('preprocessing', {}).get(
+            'non_finite_policy', 'zero')).lower()
+        if policy == 'error':
+            raise ValueError(
+                f"The {split} split contains {count} NaN/Inf value(s) and "
+                "preprocessing.non_finite_policy is 'error'."
+            )
+        if policy not in {'zero', 'replace_zero'}:
+            raise ValueError(f"Unsupported non-finite policy: {policy!r}")
+        self.logger.warning(
+            "Replacing %d NaN/Inf value(s) in the %s split with zeros.",
+            count, split,
+        )
+        return np.nan_to_num(data, nan=0.0, posinf=0.0, neginf=0.0)
 
     def _calibrate_model(self, X_train: np.ndarray, y_train: np.ndarray,
                          X_val: np.ndarray,
@@ -556,7 +586,13 @@ class ANSRDTPipeline:
 
     def _initialise_reasoner(self) -> SymbolicReasoner:
         """Build the Prolog bridge for representative test windows."""
+        if not self.symbolic_enabled:
+            raise RuntimeError(
+                "Symbolic reasoning is disabled by configuration; "
+                "no Prolog reasoner is available."
+            )
         if self.reasoner is None:
+            from src.reasoning.reasoning import SymbolicReasoner
             self.reasoner = SymbolicReasoner(
                 rules_path=self.config['paths']['reasoning_rules_path'],
                 input_shape=(self.config['model']['window_size'], len(self.feature_names)),
@@ -571,6 +607,12 @@ class ANSRDTPipeline:
             self, X_raw: np.ndarray, scores: np.ndarray,
             decision_threshold: Optional[float] = None) -> Dict[str, Any]:
         """Reason over normal, borderline and critical raw test windows."""
+        if not self.symbolic_enabled:
+            self.logger.info(
+                "Symbolic reasoning disabled; skipping representative "
+                "window explanations."
+            )
+            return {}
         if len(X_raw) == 0:
             return {}
 
@@ -655,27 +697,60 @@ class ANSRDTPipeline:
         candidates = (np.unique(np.concatenate(buckets)) if buckets
                       else np.asarray([], dtype=int))
 
-        reasoner = self._initialise_reasoner()
+        reasoner = self._initialise_reasoner() if self.symbolic_enabled else None
+        problog_program = None
+        if reasoner is not None:
+            with open(PROB_RULES_PATH, 'r') as file:
+                problog_program = file.read()
+        else:
+            self.logger.warning(
+                "Symbolic reasoning disabled; the HITL queue only contains "
+                "probability-uncertain windows."
+            )
         records = []
         for raw_index in candidates:
             index = int(raw_index)
+            score = float(scores[index])
             sensor_dict = {
                 name: float(X_raw[index, -1, feature_idx])
                 for feature_idx, name in enumerate(self.feature_names)
             }
-            reasoner.state_history = []
-            insights = reasoner.reason(sensor_dict, window=X_raw[index])
-            active_learned_rules = reasoner.get_active_learned_rule_names()
-            reason = HITLQueue.classify_reason(
-                float(scores[index]), insights, 0.0,
-                uncertain_low, uncertain_high,
-            )
+            problog_risk = None
+            if reasoner is not None:
+                reasoner.state_history = []
+                insights = reasoner.reason(sensor_dict, window=X_raw[index])
+                active_learned_rules = (
+                    reasoner.get_active_learned_rule_names()
+                )
+                reason = HITLQueue.classify_reason(
+                    score, insights, 0.0,
+                    uncertain_low, uncertain_high,
+                )
+                if (reason is None and score < uncertain_low
+                        and problog_program is not None):
+                    # Only the low-probability conflict branch needs ProbLog.
+                    problog_risk = self._problog_failure_risk(
+                        problog_program, sensor_dict, active_learned_rules
+                    )
+                    reason = HITLQueue.classify_reason(
+                        score, insights, problog_risk,
+                        uncertain_low, uncertain_high,
+                    )
+            else:
+                insights = []
+                active_learned_rules = []
+                reason = (
+                    'uncertain_probability'
+                    if uncertain_low <= score <= uncertain_high
+                    else None
+                )
             if reason is None:
                 continue
             records.append({
                 'priority': REASON_PRIORITY.get(reason, 99),
                 'window_index': index,
-                'neural_probability': float(scores[index]),
+                'neural_probability': score,
+                'problog_failure_risk': problog_risk,
                 'reason': reason,
                 'insights': insights,
                 'sensor_values': sensor_dict,
@@ -683,8 +758,6 @@ class ANSRDTPipeline:
             })
 
         records.sort(key=lambda item: (item['priority'], item['window_index']))
-        with open(PROB_RULES_PATH, 'r') as file:
-            problog_program = file.read()
 
         results_dir = self.config['paths']['results_dir']
         queue = HITLQueue(
@@ -710,21 +783,18 @@ class ANSRDTPipeline:
                 if len(queue.cases) >= max_cases:
                     break
                 index = record['window_index']
-                problog_config = self.config.get('problog', {})
-                problog = evaluate_state(
-                    problog_program, record['sensor_values'],
-                    learned_rules=record.get('active_learned_rules', []),
-                    learned_rule_weight=float(
-                        problog_config.get('learned_rule_weight', 0.15)
-                    ),
-                    max_active_learned_rules=int(
-                        problog_config.get('max_active_learned_rules', 3)
-                    ),
-                )
+                problog_risk = record.get('problog_failure_risk')
+                if problog_risk is None:
+                    problog_risk = 0.0
+                    if problog_program is not None:
+                        problog_risk = self._problog_failure_risk(
+                            problog_program, record['sensor_values'],
+                            record.get('active_learned_rules', []),
+                        )
                 queue.add_case(
                     window_index=index,
                     neural_probability=record['neural_probability'],
-                    problog_failure_risk=float(problog['failure_risk']),
+                    problog_failure_risk=problog_risk,
                     reason=record['reason'],
                     insights=record['insights'],
                     sensor_values=record['sensor_values'],
@@ -756,16 +826,15 @@ class ANSRDTPipeline:
         validation_split = float(
             self.config['training'].get('validation_split', 0.2)
         )
-        test_split = float(self.config['training'].get('test_split', 0.1))
         train_fraction = float(
             self.config['training'].get('train_fraction', 0.2)
         )
         random_state = int(self.config['training'].get('random_state', 42))
+        held_out_fraction = max(
+            0.0, 1.0 - train_fraction - validation_split
+        )
 
         if self.config['paths'].get('test_file'):
-            held_out_fraction = max(
-                0.0, 1.0 - train_fraction - validation_split
-            )
             X_train, X_val, _, y_train, y_val, _ = (
                 self.data_loader.split_by_unit(
                     X, y, validation_split=validation_split,
@@ -782,10 +851,15 @@ class ANSRDTPipeline:
             test_rul = np.asarray(self.data_loader.window_rul)
             test_source = self.config['paths']['test_file']
         else:
+            self.logger.warning(
+                "test_file is not configured; using the remaining %.0f%% of "
+                "engines as held-out test split instead of the official "
+                "FD001 test engines.", 100.0 * held_out_fraction,
+            )
             X_train, X_val, X_test, y_train, y_val, y_test = (
                 self.data_loader.split_by_unit(
                     X, y, validation_split=validation_split,
-                    test_split=test_split, random_state=random_state,
+                    test_split=held_out_fraction, random_state=random_state,
                 )
             )
             masks = self.data_loader.last_split_masks
@@ -796,6 +870,10 @@ class ANSRDTPipeline:
             test_cycles = train_cycles_all[masks['test']]
             test_rul = train_rul_all[masks['test']]
             test_source = 'held-out units from training trajectories'
+
+        X_train = self._sanitize_non_finite(X_train, 'train')
+        X_val = self._sanitize_non_finite(X_val, 'validation')
+        X_test = self._sanitize_non_finite(X_test, 'test')
 
         self.logger.info(
             "Windows: train=%d val=%d test=%d | "
@@ -815,6 +893,70 @@ class ANSRDTPipeline:
             'val_rul': val_rul, 'test_rul': test_rul,
             'test_source': test_source,
         }
+
+    def _verify_symbolic_train_provenance(
+            self, splits: Dict[str, Any]) -> Dict[str, Any]:
+        """Fail fast when rules.pl facts were not derived from the training split.
+
+        The static Prolog facts are the only symbolic thresholds that are not
+        recomputed at run time, so a stale file could silently carry validation
+        or test statistics into the fusion signals. Recompute the values with
+        ``python -m src.reasoning.thresholds --write`` after changing the split.
+        """
+        if not self.symbolic_enabled:
+            self.logger.info(
+                "Symbolic provenance check skipped: symbolic reasoning is "
+                "disabled."
+            )
+            return {
+                'checked': False,
+                'reason': 'symbolic_reasoning.enabled is false',
+            }
+        is_cmapss = getattr(
+            self, 'is_cmapss',
+            isinstance(getattr(self, 'data_loader', None), CMAPSSLoader),
+        )
+        data_file = self.config['paths'].get('data_file')
+        if not is_cmapss or not data_file or not os.path.exists(data_file):
+            self.logger.info(
+                "Symbolic provenance check skipped: no C-MAPSS parquet run."
+            )
+            return {'checked': False, 'reason': 'no C-MAPSS parquet run'}
+
+        rules_path = self.config['paths']['reasoning_rules_path']
+        train_units = sorted({
+            int(unit) for unit in np.asarray(splits['train_units']).tolist()
+        })
+        with open(rules_path) as rules_file:
+            rules_text = rules_file.read()
+        report = verify_train_provenance(
+            rules_text,
+            self.data_loader._read_frame(data_file),
+            train_units,
+        )
+        if report['mismatches']:
+            details = '; '.join(
+                f"{item['fact']} {item['key']}: expected "
+                f"{item['expected']}, found {item['found']}"
+                for item in report['mismatches'][:5]
+            )
+            raise RuntimeError(
+                f"Symbolic thresholds in {rules_path} do not match the "
+                f"training split ({len(train_units)} engines). Recompute them "
+                "with `python -m src.reasoning.thresholds --write`. " + details
+            )
+        report.update({
+            'checked': True,
+            'split': 'train',
+            'train_engines': len(train_units),
+            'rules_path': rules_path,
+            'data_file': data_file,
+        })
+        self.logger.info(
+            "Symbolic thresholds verified against the %d training engines "
+            "(%d facts).", len(train_units), report['checked_facts'],
+        )
+        return report
 
     def _model_paths(self, architecture: str,
                      suffix: str = '') -> Dict[str, str]:
@@ -1116,7 +1258,7 @@ class ANSRDTPipeline:
         return {
             'architecture': architecture,
             'model_path': model_path,
-            'feature_count': int(prepared['X_train'].shape[1]),
+            'feature_count': int(self.model.n_features),
             'calibration': calibration_info,
             'calibration_report': calibration_report,
             'decision_threshold': threshold_report,
@@ -1142,6 +1284,26 @@ class ANSRDTPipeline:
                                 predicted_rul: Optional[np.ndarray],
                                 label: str) -> np.ndarray:
         """Reason over every window and build the logistic-fusion matrix."""
+        fusion_config = self.config.get('fusion', {})
+        feature_order = fusion_config.get(
+            'features',
+            [
+                'neural_probability', 'symbolic_rule_score',
+                'problog_failure_risk', 'predicted_rul',
+            ],
+        )
+        if not self.symbolic_enabled:
+            self.logger.info(
+                "Symbolic reasoning disabled; fusion uses zero symbolic "
+                "and ProbLog signals."
+            )
+            if predicted_rul is None:
+                predicted_rul = np.zeros(len(X_raw), dtype=float)
+            zeros = np.zeros(len(X_raw), dtype=float)
+            return ProbabilityFusion.build_matrix(
+                neural_scores, zeros, zeros, predicted_rul,
+                feature_order=feature_order,
+            )
         reasoner = self._initialise_reasoner()
         with open(PROB_RULES_PATH, 'r') as file:
             problog_program = file.read()
@@ -1180,18 +1342,26 @@ class ANSRDTPipeline:
             problog_logger.setLevel(previous_problog_level)
         if predicted_rul is None:
             predicted_rul = np.zeros(len(X_raw), dtype=float)
-        fusion_config = self.config.get('fusion', {})
         return ProbabilityFusion.build_matrix(
             neural_scores, symbolic_scores, problog_risks,
-            predicted_rul,
-            feature_order=fusion_config.get(
-                'features',
-                [
-                    'neural_probability', 'symbolic_rule_score',
-                    'problog_failure_risk', 'predicted_rul',
-                ],
+            predicted_rul, feature_order=feature_order,
+        )
+
+    def _problog_failure_risk(self, program, sensor_values,
+                              learned_rules=None) -> float:
+        """Evaluate the ProbLog failure model for one sensor snapshot."""
+        problog_config = self.config.get('problog', {})
+        result = evaluate_state(
+            program, sensor_values,
+            learned_rules=learned_rules or [],
+            learned_rule_weight=float(
+                problog_config.get('learned_rule_weight', 0.15)
+            ),
+            max_active_learned_rules=int(
+                problog_config.get('max_active_learned_rules', 3)
             ),
         )
+        return float(result['failure_risk'])
 
     def _apply_fusion(self, prepared: Dict[str, Any],
                       splits: Dict[str, Any],
@@ -1307,7 +1477,12 @@ class ANSRDTPipeline:
 
         temporal_config = self.config.get('temporal', {})
         temporal_path = None
-        if temporal_config.get('enabled', True):
+        if temporal_config.get('enabled', True) and not self.symbolic_enabled:
+            self.logger.warning(
+                "Temporal symbolic rules skipped: symbolic_reasoning.enabled "
+                "is false."
+            )
+        elif temporal_config.get('enabled', True):
             reasoner = self._initialise_reasoner()
             sensor_thresholds = reasoner.get_sensor_thresholds()
             self.temporal_thresholds = compute_temporal_thresholds(
@@ -1328,6 +1503,44 @@ class ANSRDTPipeline:
             self.logger.info(
                 "Temporal thresholds saved to %s (training windows only).",
                 temporal_path,
+            )
+
+        symbolic_provenance = self._verify_symbolic_train_provenance(splits)
+
+        rule_validation = None
+        rule_validation_path = None
+        rule_validation_config = self.config.get('hitl', {}).get(
+            'rule_validation', {}
+        )
+        if (rule_validation_config.get('enabled', True)
+                and not self.symbolic_enabled):
+            self.logger.warning(
+                "Learned-rule validation skipped: symbolic reasoning is "
+                "disabled."
+            )
+        elif rule_validation_config.get('enabled', True):
+            reasoner = self._initialise_reasoner()
+            rule_validation = reasoner.validate_learned_rules(
+                splits['X_val'], self.feature_names, splits['y_val'],
+                min_precision=float(
+                    rule_validation_config.get('min_precision', 0.9)
+                ),
+                min_support=int(
+                    rule_validation_config.get('min_support', 5)
+                ),
+                max_false_positive_rate=float(
+                    rule_validation_config.get('max_false_positive_rate', 0.05)
+                ),
+                apply=bool(rule_validation_config.get('apply', True)),
+            )
+            rule_validation_path = os.path.join(
+                self.config['paths']['results_dir'],
+                'hitl_rule_validation.json',
+            )
+            with open(rule_validation_path, 'w') as file:
+                json.dump(rule_validation, file, indent=2, cls=NumpyEncoder)
+            self.logger.info(
+                "Learned-rule validation: %s", rule_validation['summary']
             )
 
         fusion = self._apply_fusion(
@@ -1360,36 +1573,6 @@ class ANSRDTPipeline:
             )
         else:
             alerting = evaluation['alerting']
-
-        rule_validation = None
-        rule_validation_path = None
-        rule_validation_config = self.config.get('hitl', {}).get(
-            'rule_validation', {}
-        )
-        if rule_validation_config.get('enabled', True):
-            reasoner = self._initialise_reasoner()
-            rule_validation = reasoner.validate_learned_rules(
-                splits['X_val'], self.feature_names, splits['y_val'],
-                min_precision=float(
-                    rule_validation_config.get('min_precision', 0.9)
-                ),
-                min_support=int(
-                    rule_validation_config.get('min_support', 5)
-                ),
-                max_false_positive_rate=float(
-                    rule_validation_config.get('max_false_positive_rate', 0.05)
-                ),
-                apply=bool(rule_validation_config.get('apply', True)),
-            )
-            rule_validation_path = os.path.join(
-                self.config['paths']['results_dir'],
-                'hitl_rule_validation.json',
-            )
-            with open(rule_validation_path, 'w') as file:
-                json.dump(rule_validation, file, indent=2, cls=NumpyEncoder)
-            self.logger.info(
-                "Learned-rule validation: %s", rule_validation['summary']
-            )
 
         explanations = self._explain_representative_windows(
             splits['X_test'], test_scores, decision_threshold
@@ -1457,6 +1640,7 @@ class ANSRDTPipeline:
             },
             'engine_metrics': engine_metrics,
             'hitl_rule_validation': rule_validation,
+            'symbolic_rule_provenance': symbolic_provenance,
             'representative_windows': explanations,
             'hitl_queue': hitl_queue,
             'artifacts': {

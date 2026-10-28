@@ -62,10 +62,14 @@ thresholding:
 # ===============================
 # Training Configuration
 # ===============================
+# FD001 protocol: train_fraction and validation_split select whole engines;
+# the remaining engines are held out. When paths.test_file is configured it
+# supplies the official test engines (20% train / 20% validation / 100 test).
 training:
   train_fraction: 0.2
   validation_split: 0.2
-  test_split: 0.1
+  test_split: 0.1              # legacy synthetic path only
+  rul_threshold: 30            # positive class: end-of-window RUL <= this value
   random_state: 42
 
 # ===============================
@@ -102,6 +106,9 @@ paths:
 # Symbolic Reasoning Configuration
 # ===============================
 symbolic_reasoning:
+  # Gates the Prolog layer in the FD001 pipeline. When false, temporal rules,
+  # learned-rule validation, symbolic fusion signals and rule-conflict HITL
+  # reasons are skipped (fusion then uses zero symbolic/ProbLog signals).
   enabled: true
   extraction_threshold: 0.6
   min_confidence: 0.7

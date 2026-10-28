@@ -60,8 +60,9 @@ The neural model detects degradation from sliding windows. RandomForest remains 
 - **Model comparison:** `python main.py --compare-models` evaluates RandomForest and LightGBM on the same engine-level split. The selected model is chosen from validation metrics only; the comparison report records `selection_split: "validation"`.
 - **Engine-level metrics:** per-engine recall, precision, false alarms, first alert cycle, lead time and anticipation are exported to `results/engine_metrics_validation.csv` and `results/engine_metrics_test.csv`, plus fusion and per-architecture copies.
 - **Temporal rules:** slopes, relative changes, moving averages, standard deviation and persistence are computed per window. Their thresholds come from training windows only (`results/temporal_thresholds.json`). They are computed before fusion so training and inference use the same symbolic contract.
-- **Learned-rule validation:** at the start of a pipeline run, existing HITL rules are checked on validation windows before being used. A rule must reach precision `>= 0.90`, support `>= 5` and false-positive rate `<= 0.05`; rejected rules are removed automatically. The report is `results/hitl_rule_validation.json`.
-- **Input quality:** NaN/Inf values are either replaced by zero (default) or rejected, controlled by `preprocessing.non_finite_policy`.
+- **Learned-rule validation:** existing HITL rules are checked on validation windows before fusion, explanations and HITL queue construction. A rule must reach precision `>= 0.90`, support `>= 5` and false-positive rate `<= 0.05`; rejected rules are removed automatically. The report is `results/hitl_rule_validation.json`.
+- **Input quality:** NaN/Inf values in the train, validation and test splits are either replaced by zero (default) or rejected, controlled by `preprocessing.non_finite_policy`.
+- **Symbolic switch:** `symbolic_reasoning.enabled: false` skips the Prolog layer (temporal rules, learned-rule validation, explanations and rule-conflict HITL reasons); fusion then receives zero symbolic and ProbLog signals.
 
 ## Dataset and labels
 
@@ -69,23 +70,35 @@ The neural model detects degradation from sliding windows. RandomForest remains 
 - **External test:** official NASA C-MAPSS `test_FD001.txt` and `RUL_FD001.txt`.
 - **Fallback:** raw `train_FD001.txt` is also supported when the processed parquet is unavailable.
 - **Selected sensors (14):** `s2, s3, s4, s7, s8, s9, s11, s12, s13, s14, s15, s17, s20, s21`.
-- **Label:** a window is positive when its final-cycle RUL is `<= 30`.
-- **Low-data protocol:** 20% of engines for training, 20% for validation, and the 100 official test engines for evaluation.
+- **Label:** a window is positive when its final-cycle RUL is `<= training.rul_threshold` (default `30`).
+- **Low-data protocol:** 20% of engines for training, 20% for validation, and the 100 official test engines for evaluation. When `paths.test_file` is not configured, the remaining engines are used as the held-out test split and a warning is emitted.
 
 Place the data files under `data/raw/CMAPSS/`. The directory is ignored by git because the files are downloaded separately.
 
 ### Symbolic thresholds
 
-Thresholds are derived from training percentiles, not from the test set:
+Thresholds are derived from the 20 training engines selected by the pipeline's 20/20/60 unit split (`random_state=42`), before any validation or held-out engine is seen:
 
 | Condition | Threshold | Interpretation |
 |---|---:|---|
-| `s4` elevated | `> 1414.555` | HPC outlet temperature elevated (75th percentile) |
-| `s4` critical | `> 1425.670` | HPC outlet temperature critical (95th percentile) |
-| `s11` high | `> 47.700` | HPC static pressure high |
-| `s7` low | `< 552.810` | HPC outlet pressure low |
-| `s12` low | `< 520.960` | Fuel flow low |
-| `s21` low | `< 23.222` | Coolant bleed low |
+| `s4` elevated | `> 1414.993` | HPC outlet temperature elevated (75th percentile) |
+| `s4` critical | `> 1426.015` | HPC outlet temperature critical (95th percentile) |
+| `s11` high | `> 47.710` | HPC static pressure high |
+| `s7` low | `< 552.777` | HPC outlet pressure low |
+| `s12` low | `< 520.930` | Fuel flow low |
+| `s21` low | `< 23.218` | Coolant bleed low |
+
+Recompute the facts from the same training split (the command prints a Prolog block; add `--write` to update `src/reasoning/rules.pl` in place):
+
+```bash
+python -m src.reasoning.thresholds \
+  --data data/raw/CMAPSS/FD001_processed.parquet
+# add --write to persist the values
+```
+
+The defaults match the FD001 protocol (`--validation-split 0.2`, `--test-split 0.6`, `--random-state 42`). Keep these options aligned with `training` and `paths` in `configs/config.yaml`; `tests/test_rule_thresholds.py` checks the committed values against this split when the parquet is available.
+
+Every C-MAPSS run also re-derives these facts from the training engines and compares them with `rules.pl` before the symbolic layer is used. A mismatch aborts the run with the recompute command instead of silently feeding validation or test statistics into fusion; the check is recorded under `symbolic_rule_provenance` in `results/final_run_results.json` (`tests/test_symbolic_provenance.py`).
 
 Spearman analysis on the training set shows that `s4`, `s11`, `s15`, `s17`, `s2` and `s3` rise with degradation, while `s7`, `s12`, `s20` and `s21` fall.
 
@@ -185,7 +198,7 @@ python -m unittest discover -s tests -q
 
 ## Current results
 
-The reported run is `python main.py --architecture lightgbm`, using 20 engines for training, 20 for validation and the 100 official test engines. The neural threshold is `0.0733` and the validation-selected fusion threshold is `0.2220`.
+The reported run is `python main.py --architecture lightgbm`, using 20 engines for training, 20 for validation and the 100 official test engines. The neural threshold is `0.0733` and the validation-selected fusion threshold is `0.2196`.
 
 ### RandomForest vs LightGBM comparison
 
@@ -200,12 +213,12 @@ The reported run is `python main.py --architecture lightgbm`, using 20 engines f
 
 | Split | Accuracy | Precision | Recall | F1 | ROC-AUC | Avg. precision |
 |---|---:|---:|---:|---:|---:|---:|
-| Validation | 0.9414 | 0.7503 | 0.9839 | 0.8514 | 0.9920 | 0.9610 |
-| Official test | 0.9821 | 0.6556 | 0.9518 | 0.7764 | 0.9952 | 0.8703 |
+| Validation | 0.9412 | 0.7500 | 0.9823 | 0.8506 | 0.9920 | 0.9593 |
+| Official test | 0.9813 | 0.6448 | 0.9458 | 0.7668 | 0.9950 | 0.8627 |
 
-Test confusion matrix: `[[9698, 166], [16, 316]]`.
+Test confusion matrix: `[[9691, 173], [18, 314]]`.
 
-Fusion slightly lowers validation F1 relative to the raw LightGBM neural model (`0.8540` to `0.8514`) but improves official-test precision (`0.6184` to `0.6556`), F1 (`0.7616` to `0.7764`) and false alarms (`203` to `166`). Recall decreases from `0.9910` to `0.9518`, so the trade-off is explicit rather than uniformly better. The official test windows are highly imbalanced (`3.26%` positive), so accuracy alone is misleading; F1, recall, average precision and ROC-AUC are the more useful indicators.
+Fusion slightly lowers validation F1 relative to the raw LightGBM neural model (`0.8540` to `0.8506`) but improves official-test precision (`0.6184` to `0.6448`), F1 (`0.7616` to `0.7668`) and false alarms (`203` to `173`). Recall decreases from `0.9910` to `0.9458`, so the trade-off is explicit rather than uniformly better. The official test windows are highly imbalanced (`3.26%` positive), so accuracy alone is misleading; F1, recall, average precision and ROC-AUC are the more useful indicators.
 
 ### Calibration
 
@@ -216,17 +229,17 @@ Fusion slightly lowers validation F1 relative to the raw LightGBM neural model (
 | Validation | 0.0275 | 0.0185 |
 | Official test | 0.0100 | 0.0073 |
 
-The fused probabilities have validation Brier `0.0318` and test Brier `0.0112`.
+The fused probabilities have validation Brier `0.0316` and test Brier `0.0114`.
 
 ### Engine-level metrics (official test, fusion)
 
 | Metric | Value |
 |---|---:|
 | Engines with at least one positive window | 25 / 100 |
-| Mean per-engine recall | 0.9095 |
-| Mean per-engine precision | 0.6407 |
-| Total false alarms | 166 |
-| Mean false alarms per engine | 1.66 |
+| Mean per-engine recall | 0.8882 |
+| Mean per-engine precision | 0.6041 |
+| Total false alarms | 173 |
+| Mean false alarms per engine | 1.73 |
 | Mean lead time before last observed cycle | 12.29 cycles |
 | Mean anticipation at first correct alert | 29.54 cycles |
 | Alerted before end-of-life among relevant engines | 0.96 |
@@ -237,12 +250,12 @@ Most FD001 test trajectories never enter the `RUL <= 30` failure zone, hence the
 
 | Mode | Total false alarms | Mean recall | Mean precision |
 |---|---:|---:|---:|
-| Immediate | 166 | 0.9095 | 0.6407 |
-| Consecutive 2 | 148 | 0.9064 | 0.6613 |
-| Consecutive 3 | 146 | 0.8725 | 0.6483 |
-| Smoothed 3 | 153 | 0.9046 | 0.6706 |
+| Immediate | 173 | 0.8882 | 0.6041 |
+| Consecutive 2 | 153 | 0.8637 | 0.6400 |
+| Consecutive 3 | 141 | 0.8565 | 0.6730 |
+| Smoothed 3 | 156 | 0.9216 | 0.6615 |
 
-Consecutive confirmation removes isolated alerts at a small recall cost. Smoothing gives the best precision in this run.
+Consecutive confirmation removes isolated alerts at a small recall cost. Requiring three consecutive alerts gives the best precision in this run.
 
 ### Auxiliary RUL regression
 
@@ -261,18 +274,20 @@ The standalone examples in `src/reasoning/prob_query.py` produce:
 | Example | `P(failure_risk)` |
 |---|---:|
 | Normal | 0.0000 |
-| Degraded | 0.4318 |
-| Critical | 0.6452 |
+| Degraded | 0.5218 |
+| Critical | 0.6939 |
 
 The representative test windows selected by the LightGBM pipeline are:
 
-| Window | Fused probability | ProbLog risk |
+| Window | Neural probability | ProbLog risk |
 |---|---:|---:|
 | Normal | 0.0000 | 0.0000 |
-| Degraded / near threshold | 0.2221 | 0.4318 |
-| Critical | 0.9910 | 0.4318 |
+| Degraded / near threshold | 0.2193 | 0.1963 |
+| Critical | 0.9910 | 0.3120 |
 
-The degraded window is a useful HITL example: its fused probability is at the decision threshold while ProbLog also reports an active degradation pattern.
+The ProbLog model keeps a dedicated pressure/flow pathway (high static pressure, low outlet pressure, low fuel flow), so strong pressure and fuel evidence raises the failure risk even when the outlet temperature is not elevated.
+
+The degraded window is a useful HITL example: its neural probability sits on the validation-selected fusion threshold (`0.2196`) while ProbLog also reports an active degradation pattern.
 
 ## Human-in-the-loop
 
@@ -284,12 +299,12 @@ The queue is built from test windows with:
 
 The queue API also supports a ProbLog-risk conflict reason.
 
-Current LightGBM + fusion run: **200 queued cases** from 776 evaluated candidates (`287` eligible).
+Current LightGBM + fusion run: **200 queued cases** from 777 evaluated candidates (`273` eligible).
 
 | Reason | Cases |
 |---|---:|
-| Uncertain probability | 89 |
-| Rule/probability conflict (low neural, rule active) | 111 |
+| Uncertain probability | 104 |
+| Rule/probability conflict (low neural, rule active) | 96 |
 | Rule/probability conflict (high neural, no strong rule) | 0 |
 
 Workflow:
@@ -339,27 +354,26 @@ src/
     rules.pl                      # HPC symbolic rules, thresholds and temporal rules
     prob_rules.pl                 # ProbLog failure-risk model
     prob_query.py                 # ProbLog examples and evaluation
+    thresholds.py                 # recompute rules.pl facts from the training split
     reasoning.py                  # PySWIP bridge, rule learning, condition queries
     temporal.py                   # train-only temporal features and thresholds
     rules_learned.pl              # rules learned from HITL feedback
-    rule_learning.py
-    state_tracker.py
   utils/
     model_utils.py                # scaler and model persistence
-tests/                            # 81 unit and integration tests
+tests/                            # 106 unit and integration tests
 results/                          # generated artifacts (ignored by git)
 ```
 
 ## Testing
 
-The suite covers the C-MAPSS loader, RandomForest/LightGBM classifiers, calibration, thresholding, engine metrics, temporal features, RUL regression, alert confirmation, probability fusion, config validation, learned-rule validation, ProbLog, the pipeline, inference, the HITL queue and HITL feedback:
+The suite covers the C-MAPSS loader, RandomForest/LightGBM classifiers, calibration, thresholding, engine metrics, temporal features, RUL regression, alert confirmation, probability fusion, config validation, learned-rule validation, symbolic-threshold provenance, the published README metrics, ProbLog, the pipeline, inference, the HITL queue and HITL feedback:
 
 ```bash
 $env:Path = "C:\Program Files\swipl\bin;$env:Path"
 python -m unittest discover -s tests -q
 ```
 
-Expected result: `81 tests ... OK`.
+Expected result: `106 tests ... OK`. The FD001 threshold, provenance and classifier tests, plus the README metric check, are skipped when the parquet or run artifacts are missing.
 
 ## Limitations
 

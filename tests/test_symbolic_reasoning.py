@@ -4,9 +4,10 @@ import logging
 import unittest
 
 from src.reasoning.prob_query import EXAMPLES
-from src.reasoning.reasoning import SymbolicReasoner
+from src.reasoning.reasoning import PYSWIP_AVAILABLE, SymbolicReasoner
 
 
+@unittest.skipUnless(PYSWIP_AVAILABLE, "SWI-Prolog/PySWIP not available")
 class TestSymbolicReasoning(unittest.TestCase):
     @classmethod
     def setUpClass(cls):
