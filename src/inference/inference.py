@@ -23,7 +23,8 @@ from src.reasoning.prob_query import RULES_PATH as PROB_RULES_PATH, evaluate_sta
 from src.reasoning.reasoning import SymbolicReasoner
 from src.config.config_manager import load_config
 from src.data.cmapss_loader import CMAPSSLoader
-from src.data.data_loader import DataLoader
+from src.monitoring.drift import check_inference_drift
+from legacy.synthetic_data_loader import DataLoader
 
 
 class InferencePipeline:
@@ -321,9 +322,28 @@ class InferencePipeline:
             y_scores, y_pred = self.get_predictions(
                 X_model, X_raw=X_raw, insights=insights
             )
+            drift = check_inference_drift(
+                X_raw, self.feature_names, self.results_dir,
+                self.config.get('monitoring', {}).get('drift', {}),
+                label='inference', signals={'fused_risk': y_scores},
+            )
+            if drift is not None and drift['level'] in ('warning', 'critical'):
+                self.logger.warning(
+                    "Input drift level=%s (score=%.4f): %s",
+                    drift['level'], drift['score'], drift['recommendation'],
+                )
 
             results = {
                 'mode': 'cmapss',
+                'drift': None if drift is None else {
+                    'level': drift['level'],
+                    'status': drift['status'],
+                    'score': drift['score'],
+                    'recommendation': drift['recommendation'],
+                    'warning_features': drift['warning_features'],
+                    'critical_features': drift['critical_features'],
+                    'hitl_recommended': drift['hitl_recommended'],
+                },
                 'unit_ids': loader.unit_ids.tolist(),
                 'cycles': loader.window_end_cycles.tolist(),
                 'failure_probabilities': y_scores.tolist(),

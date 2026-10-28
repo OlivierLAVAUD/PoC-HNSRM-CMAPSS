@@ -155,6 +155,142 @@ class TestConfigValidation(unittest.TestCase):
                 config, self.logger, '/tmp/project', '/tmp/project/configs'
             )
 
+    def test_rejects_invalid_operational_policy(self):
+        config = self._minimal_config()
+        config['operational_policy'] = {
+            'enabled': True,
+            'false_negative_cost': 0.0,
+            'false_alarm_cost': 0.0,
+        }
+        with self.assertRaises(ValueError):
+            validate_config(
+                config, self.logger, '/tmp/project', '/tmp/project/configs'
+            )
+
+        config = self._minimal_config()
+        config['operational_policy'] = {
+            'enabled': True,
+            'false_negative_cost': 10.0,
+            'false_alarm_cost': 1.0,
+            'preferred_alert_mode': 'sometimes',
+        }
+        with self.assertRaises(ValueError):
+            validate_config(
+                config, self.logger, '/tmp/project', '/tmp/project/configs'
+            )
+
+        config = self._minimal_config()
+        config['operational_policy'] = {
+            'enabled': True,
+            'selection_metric': 'accuracy',
+        }
+        with self.assertRaises(ValueError):
+            validate_config(
+                config, self.logger, '/tmp/project', '/tmp/project/configs'
+            )
+
+    def test_rejects_invalid_drift_thresholds(self):
+        config = self._minimal_config()
+        config['monitoring'] = {
+            'drift': {
+                'enabled': True,
+                'warning_threshold': 0.3,
+                'critical_threshold': 0.1,
+                'min_windows': 10,
+            }
+        }
+        with self.assertRaises(ValueError):
+            validate_config(
+                config, self.logger, '/tmp/project', '/tmp/project/configs'
+            )
+
+        config = self._minimal_config()
+        config['monitoring'] = {
+            'drift': {'enabled': True, 'min_windows': 0}
+        }
+        with self.assertRaises(ValueError):
+            validate_config(
+                config, self.logger, '/tmp/project', '/tmp/project/configs'
+            )
+
+    def test_rejects_invalid_experiment_settings(self):
+        config = self._minimal_config()
+        config['experiments'] = {
+            'multi_seed': {'enabled': True, 'seeds': [42, 42]}
+        }
+        with self.assertRaises(ValueError):
+            validate_config(
+                config, self.logger, '/tmp/project', '/tmp/project/configs'
+            )
+
+        config = self._minimal_config()
+        config['threshold_sensitivity'] = {
+            'enabled': True, 'strategies': ['accuracy']
+        }
+        with self.assertRaises(ValueError):
+            validate_config(
+                config, self.logger, '/tmp/project', '/tmp/project/configs'
+            )
+
+        config = self._minimal_config()
+        config['fusion'] = {
+            'enabled': True,
+            'validation': {'method': 'bootstrap', 'n_splits': 5},
+        }
+        with self.assertRaises(ValueError):
+            validate_config(
+                config, self.logger, '/tmp/project', '/tmp/project/configs'
+            )
+
+    def test_accepts_new_extension_sections(self):
+        config = self._minimal_config()
+        config['experiments'] = {
+            'multi_seed': {
+                'enabled': True, 'seeds': [42, 43],
+                'selection_metric': 'fbeta', 'beta': 2.0,
+            },
+        }
+        config['threshold_sensitivity'] = {
+            'enabled': True,
+            'strategies': ['recall_at_precision', 'fbeta', 'f1'],
+            'min_precision_values': [0.75],
+            'beta_values': [2.0],
+        }
+        config['operational_policy'] = {
+            'enabled': True,
+            'false_negative_cost': 10.0,
+            'false_alarm_cost': 1.0,
+            'inspection_capacity_per_cycle': 2.0,
+            'selection_metric': 'expected_cost',
+            'preferred_alert_mode': 'consecutive_2',
+        }
+        config['fusion'] = {
+            'enabled': True,
+            'validation': {
+                'method': 'group_kfold', 'n_splits': 5,
+                'n_repeats': 1, 'random_state': 42,
+            },
+        }
+        config['monitoring'] = {
+            'drift': {
+                'enabled': True, 'warning_threshold': 0.05,
+                'critical_threshold': 0.15, 'min_windows': 30,
+            }
+        }
+        config['audit'] = {
+            'enabled': True, 'max_records': 1000, 'include_insights': 25,
+        }
+        with tempfile.TemporaryDirectory() as tmpdir:
+            config_dir = os.path.join(tmpdir, 'configs')
+            data_dir = os.path.join(tmpdir, 'data', 'raw', 'CMAPSS')
+            reasoning_dir = os.path.join(tmpdir, 'src', 'reasoning')
+            os.makedirs(config_dir, exist_ok=True)
+            os.makedirs(data_dir, exist_ok=True)
+            os.makedirs(reasoning_dir, exist_ok=True)
+            open(os.path.join(data_dir, 'FD001_processed.parquet'), 'a').close()
+            open(os.path.join(reasoning_dir, 'rules.pl'), 'a').close()
+            validate_config(config, self.logger, tmpdir, config_dir)
+
     def test_validate_config_missing_key(self):
         config = {
             'model': {},

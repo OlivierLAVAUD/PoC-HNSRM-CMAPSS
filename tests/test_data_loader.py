@@ -6,7 +6,7 @@ import unittest
 
 import numpy as np
 
-from src.data.data_loader import DataLoader
+from legacy.synthetic_data_loader import DataLoader
 
 
 class TestDataLoader(unittest.TestCase):

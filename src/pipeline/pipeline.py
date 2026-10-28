@@ -21,7 +21,7 @@ from sklearn.metrics import (
 )
 
 from src.data.cmapss_loader import CMAPSSLoader
-from src.data.data_loader import DataLoader, create_data_loader
+from src.data.loader_factory import create_data_loader
 from src.data.data_processing import map_labels
 from src.evaluation.calibration import calibration_metrics, save_reliability_plot
 from src.evaluation.alerting import compare_alerting
@@ -29,11 +29,18 @@ from src.evaluation.engine_metrics import (
     compute_engine_metrics,
     export_engine_metrics_csv,
 )
+from src.evaluation.operational_policy import (
+    alert_predictions,
+    build_operational_policy_report,
+    save_operational_policy,
+)
 from src.evaluation.thresholding import (
     save_precision_recall_plot,
     select_threshold,
 )
+from src.experiments.threshold_sensitivity import run_threshold_sensitivity
 from src.features.temporal_features import TemporalFeatureExtractor
+from src.fusion.diagnostics import run_fusion_diagnostics
 from src.fusion.probability_fusion import (
     ProbabilityFusion,
     evaluate_probability_fusion,
@@ -45,10 +52,22 @@ from src.models.rul_regressor import (
     RULLightGBMRegressor,
     out_of_fold_predictions,
 )
+from src.monitoring.drift import (
+    analyse_drift,
+    save_drift_report,
+    save_reference,
+    reference_statistics,
+)
 from src.preprocessing.preprocessing import preprocess_sequences
-from src.reasoning.prob_query import RULES_PATH as PROB_RULES_PATH, evaluate_state
+from src.reasoning.prob_query import (
+    RULES_PATH as PROB_RULES_PATH,
+    THRESHOLDS as DEFAULT_HPC_THRESHOLDS,
+    evaluate_state,
+    load_hpc_thresholds,
+)
 from src.reasoning.temporal import compute_temporal_thresholds
 from src.reasoning.thresholds import verify_train_provenance
+from src.utils.audit import AuditTrail, build_artifact_versions
 from src.utils.model_utils import save_scaler
 
 if TYPE_CHECKING:
@@ -277,6 +296,123 @@ def _validate_model_and_training(config: dict) -> None:
                 "the official test split cannot drive model selection."
             )
 
+    multi_seed = config.get('experiments', {}).get('multi_seed', {})
+    if multi_seed:
+        seeds = multi_seed.get('seeds', [42])
+        if (not isinstance(seeds, list) or not seeds
+                or not all(isinstance(seed, int) and not isinstance(seed, bool)
+                           for seed in seeds)):
+            raise ValueError(
+                "experiments.multi_seed.seeds must be a non-empty list of "
+                "integers."
+            )
+        if len(set(seeds)) != len(seeds):
+            raise ValueError("experiments.multi_seed.seeds must be unique.")
+        if multi_seed.get('selection_metric', 'fbeta') not in {
+                'f1', 'fbeta', 'recall', 'average_precision', 'roc_auc'}:
+            raise ValueError(
+                "experiments.multi_seed.selection_metric must be one of "
+                "f1, fbeta, recall, average_precision, roc_auc."
+            )
+        if 'beta' in multi_seed:
+            _require_range(multi_seed['beta'],
+                           'experiments.multi_seed.beta', 0.0, 100.0,
+                           allow_low=False)
+
+    sensitivity = config.get('threshold_sensitivity', {})
+    if sensitivity.get('enabled', False):
+        strategies = sensitivity.get('strategies', [])
+        allowed = {'recall_at_precision', 'fbeta', 'f1'}
+        if (not isinstance(strategies, list) or not strategies
+                or not all(strategy in allowed for strategy in strategies)):
+            raise ValueError(
+                "threshold_sensitivity.strategies must be a non-empty list "
+                "drawn from 'recall_at_precision', 'fbeta', 'f1'."
+            )
+        for key in ('min_precision_values', 'beta_values'):
+            values = sensitivity.get(key, []) or []
+            if not isinstance(values, list):
+                raise ValueError(
+                    f"threshold_sensitivity.{key} must be a list."
+                )
+            for value in values:
+                low, high = ((0.0, 1.0) if key == 'min_precision_values'
+                             else (0.0, 100.0))
+                _require_range(value, f'threshold_sensitivity.{key}',
+                               low, high)
+
+    policy = config.get('operational_policy', {})
+    if policy.get('enabled', False):
+        _require_range(policy.get('false_negative_cost', 10.0),
+                       'operational_policy.false_negative_cost', 0.0, 1e9)
+        _require_range(policy.get('false_alarm_cost', 1.0),
+                       'operational_policy.false_alarm_cost', 0.0, 1e9)
+        if (float(policy.get('false_negative_cost', 10.0)) == 0.0
+                and float(policy.get('false_alarm_cost', 1.0)) == 0.0):
+            raise ValueError(
+                "operational_policy costs cannot both be zero."
+            )
+        if policy.get('selection_metric', 'expected_cost') not in {
+                'expected_cost', 'fbeta', 'recall', 'f1', 'precision'}:
+            raise ValueError(
+                "operational_policy.selection_metric must be one of "
+                "expected_cost, fbeta, recall, f1, precision."
+            )
+        capacity = policy.get('inspection_capacity_per_cycle')
+        if capacity is not None:
+            _require_range(capacity,
+                           'operational_policy.inspection_capacity_per_cycle',
+                           0.0, 1e9)
+        preferred = policy.get('preferred_alert_mode')
+        if preferred is not None and str(preferred) not in {
+                'immediate', 'consecutive_2', 'consecutive_3',
+                'smoothed_3', 'smoothed_5'}:
+            raise ValueError(
+                "operational_policy.preferred_alert_mode must be one of "
+                "immediate, consecutive_2, consecutive_3, smoothed_3, "
+                "smoothed_5."
+            )
+
+    fusion_validation = config.get('fusion', {}).get('validation', {})
+    if fusion_validation:
+        if fusion_validation.get('method', 'group_kfold') not in {
+                'group_kfold', 'repeated_kfold'}:
+            raise ValueError(
+                "fusion.validation.method must be 'group_kfold' or "
+                "'repeated_kfold'."
+            )
+        if (not isinstance(fusion_validation.get('n_splits', 5), int)
+                or fusion_validation.get('n_splits', 5) < 2):
+            raise ValueError("fusion.validation.n_splits must be an integer >= 2.")
+        if (not isinstance(fusion_validation.get('n_repeats', 1), int)
+                or fusion_validation.get('n_repeats', 1) < 1):
+            raise ValueError("fusion.validation.n_repeats must be an integer >= 1.")
+
+    drift = config.get('monitoring', {}).get('drift', {})
+    if drift.get('enabled', False):
+        _require_range(drift.get('warning_threshold', 0.05),
+                       'monitoring.drift.warning_threshold', 0.0, 1.0)
+        _require_range(drift.get('critical_threshold', 0.15),
+                       'monitoring.drift.critical_threshold', 0.0, 1.0)
+        if float(drift.get('warning_threshold', 0.05)) >= float(
+                drift.get('critical_threshold', 0.15)):
+            raise ValueError(
+                "monitoring.drift.warning_threshold must be strictly smaller "
+                "than critical_threshold."
+            )
+        if (not isinstance(drift.get('min_windows', 30), int)
+                or drift.get('min_windows', 30) < 1):
+            raise ValueError("monitoring.drift.min_windows must be an integer >= 1.")
+
+    audit = config.get('audit', {})
+    if audit.get('enabled', False):
+        if (not isinstance(audit.get('max_records', 0), int)
+                or audit.get('max_records', 0) < 0):
+            raise ValueError("audit.max_records must be an integer >= 0.")
+        if (not isinstance(audit.get('include_insights', 25), int)
+                or audit.get('include_insights', 25) < 0):
+            raise ValueError("audit.include_insights must be an integer >= 0.")
+
     preprocessing = config.get('preprocessing', {})
     if preprocessing.get('non_finite_policy', 'zero') not in {
             'zero', 'replace_zero', 'error'}:
@@ -375,6 +511,35 @@ class ANSRDTPipeline:
         self.symbolic_enabled = bool(
             self.config.get('symbolic_reasoning', {}).get('enabled', True)
         )
+        self._hpc_threshold_cache: Optional[tuple] = None
+
+    def load_splits(self) -> Dict[str, Any]:
+        """Return the engine-level C-MAPSS split used by this configuration.
+
+        Exposed for the experiment runners so they can derive per-seed
+        symbolic thresholds before starting a full run.
+        """
+        return self._load_cmapss_splits()
+
+    def _hpc_thresholds(self) -> Dict[str, float]:
+        """Return the named HPC thresholds declared in the active rules.pl."""
+        path = self.config.get('paths', {}).get('reasoning_rules_path')
+        cached = getattr(self, '_hpc_threshold_cache', None)
+        if cached is not None and cached[0] == path:
+            return cached[1]
+        if not path:
+            self._hpc_threshold_cache = (path, dict(DEFAULT_HPC_THRESHOLDS))
+            return self._hpc_threshold_cache[1]
+        try:
+            thresholds = load_hpc_thresholds(path)
+        except (OSError, ValueError) as error:
+            self.logger.warning(
+                "Could not read HPC thresholds from %s (%s); falling back to "
+                "the packaged rules.pl values.", path, error,
+            )
+            thresholds = dict(DEFAULT_HPC_THRESHOLDS)
+        self._hpc_threshold_cache = (path, thresholds)
+        return thresholds
 
     @staticmethod
     def _normalise_architecture(architecture: str) -> str:
@@ -644,6 +809,7 @@ class ANSRDTPipeline:
                 max_active_learned_rules=int(
                     problog_config.get('max_active_learned_rules', 3)
                 ),
+                hpc_thresholds=self._hpc_thresholds(),
             )
             explanations[label] = {
                 'window_index': idx,
@@ -1331,6 +1497,7 @@ class ANSRDTPipeline:
                     max_active_learned_rules=int(
                         problog_config.get('max_active_learned_rules', 3)
                     ),
+                    hpc_thresholds=self._hpc_thresholds(),
                 )
                 problog_risks[index] = float(problog['failure_risk'])
                 if (index + 1) % 1000 == 0:
@@ -1360,6 +1527,7 @@ class ANSRDTPipeline:
             max_active_learned_rules=int(
                 problog_config.get('max_active_learned_rules', 3)
             ),
+            hpc_thresholds=self._hpc_thresholds(),
         )
         return float(result['failure_risk'])
 
@@ -1384,7 +1552,7 @@ class ANSRDTPipeline:
             prepared['rul_report'].get('test_predictions'),
             'test',
         )
-        fusion = ProbabilityFusion(
+        fusion_model = ProbabilityFusion(
             random_state=int(self.config['model'].get('random_state', 42)),
             feature_order=fusion_config.get(
                 'features',
@@ -1395,9 +1563,9 @@ class ANSRDTPipeline:
             ),
             logger=self.logger,
         )
-        fusion.fit(val_matrix, splits['y_val'])
-        val_fused = fusion.positive_proba(val_matrix)
-        test_fused = fusion.positive_proba(test_matrix)
+        fusion_model.fit(val_matrix, splits['y_val'])
+        val_fused = fusion_model.positive_proba(val_matrix)
+        test_fused = fusion_model.positive_proba(test_matrix)
         fusion_selection = select_threshold(
             splits['y_val'], val_fused,
             strategy=fusion_config.get('threshold_strategy', 'recall_at_precision'),
@@ -1412,7 +1580,7 @@ class ANSRDTPipeline:
             self.config['paths']['results_dir'], 'models',
             'probability_fusion.joblib',
         )
-        fusion.save(fusion_model_path)
+        fusion_model.save(fusion_model_path)
         threshold_path = os.path.join(
             self.config['paths']['results_dir'], 'fusion_threshold.json'
         )
@@ -1422,8 +1590,8 @@ class ANSRDTPipeline:
             'enabled': True,
             'applied': True,
             'trained_on': 'validation_split_only',
-            'features': fusion.feature_order,
-            'coefficients': fusion.coefficients(),
+            'features': fusion_model.feature_order,
+            'coefficients': fusion_model.coefficients(),
             'model_path': fusion_model_path,
             'threshold_path': threshold_path,
             'threshold': fusion_threshold,
@@ -1434,21 +1602,317 @@ class ANSRDTPipeline:
             'test_metrics': self._compute_metrics(
                 splits['y_test'], test_pred, test_fused
             ),
-            'validation_calibration': evaluate_probability_fusion(
-                splits['y_val'], val_fused
-            ),
-            'test_calibration': evaluate_probability_fusion(
-                splits['y_test'], test_fused
-            ),
+            'validation_calibration': {
+                **evaluate_probability_fusion(splits['y_val'], val_fused),
+                'ece': calibration_metrics(
+                    splits['y_val'], val_fused,
+                    n_bins=int(self.config.get('calibration', {}).get(
+                        'n_bins', 10
+                    )),
+                )['ece'],
+            },
+            'test_calibration': {
+                **evaluate_probability_fusion(splits['y_test'], test_fused),
+                'ece': calibration_metrics(
+                    splits['y_test'], test_fused,
+                    n_bins=int(self.config.get('calibration', {}).get(
+                        'n_bins', 10
+                    )),
+                )['ece'],
+            },
             'neural_threshold': float(neural_threshold),
             'val_scores': val_fused,
             'test_scores': test_fused,
+            'val_matrix': val_matrix,
+            'test_matrix': test_matrix,
         }
         self.logger.info(
             "Fusion validation metrics: %s", report['validation_metrics']
         )
         self.logger.info("Fusion test metrics: %s", report['test_metrics'])
         return report
+
+    def _write_decision_audit(
+            self, splits: Dict[str, Any], evaluation: Dict[str, Any],
+            test_scores: np.ndarray, decision_threshold: float,
+            fusion: Dict[str, Any], alert_mode: str,
+            drift: Dict[str, Any], audit_config: Dict[str, Any]
+            ) -> Dict[str, Any]:
+        """Write the JSONL audit journal with one record per decided window.
+
+        Records are ordered by alert then by risk, so a ``max_records`` cap
+        keeps the operationally relevant decisions first. Symbolic insights
+        are stored for the ``include_insights`` riskiest windows only.
+        """
+        results_dir = self.config['paths']['results_dir']
+        rules_path = self.config['paths']['reasoning_rules_path']
+        learned_rules_path = os.path.splitext(rules_path)[0] + '_learned.pl'
+        scaler_path = os.path.join(results_dir, 'scaler.pkl')
+        artifacts = build_artifact_versions(
+            architecture=str(evaluation.get('architecture', 'unknown')),
+            model_path=evaluation.get('model_path'),
+            scaler_path=scaler_path if os.path.exists(scaler_path) else None,
+            feature_metadata_path=evaluation.get('feature_metadata_path'),
+            rules_path=rules_path,
+            learned_rules_path=learned_rules_path,
+            problog_rules_path=PROB_RULES_PATH,
+        )
+        fusion_applied = bool(fusion.get('applied'))
+        thresholds = {
+            'source': (
+                'probability_fusion' if fusion_applied
+                else str(evaluation.get('architecture'))
+            ),
+            'fusion': float(decision_threshold) if fusion_applied else None,
+            'neural': float(evaluation.get('threshold', decision_threshold)),
+        }
+        run_id = datetime.now().strftime('%Y%m%dT%H%M%S')
+        max_records = int(audit_config.get('max_records', 12000) or 0)
+        trail = AuditTrail(
+            path=os.path.join(results_dir, 'decision_audit.jsonl'),
+            run_id=run_id,
+            artifacts=artifacts,
+            thresholds=thresholds,
+            enabled=True,
+            logger=self.logger,
+        )
+        trail.max_records = None if max_records <= 0 else max_records
+        include_insights = int(audit_config.get('include_insights', 25) or 0)
+
+        scores = np.asarray(test_scores, dtype=float).ravel()
+        predictions = alert_predictions(
+            scores, splits['test_units'], splits['test_cycles'],
+            decision_threshold, alert_mode,
+        )
+        order = np.lexsort((-scores, -predictions))
+        features = list(fusion.get('features') or [])
+        matrix = fusion.get('test_matrix')
+        neural_scores = np.asarray(
+            evaluation.get('test_scores', scores), dtype=float
+        ).ravel()
+        rul_predictions = evaluation.get('rul_regression', {}).get(
+            'test_predictions'
+        )
+        insight_count = 0
+        reasoner = None
+        if include_insights and self.symbolic_enabled and len(splits['X_test']):
+            reasoner = self._initialise_reasoner()
+        drift_level = drift.get('level') if drift else None
+        drift_score = drift.get('score') if drift else None
+
+        for raw_index in order:
+            position = int(raw_index)
+            window = splits['X_test'][position]
+            insights = []
+            active_rules = []
+            if reasoner is not None and insight_count < include_insights:
+                sensor_dict = {
+                    name: float(window[-1, index])
+                    for index, name in enumerate(self.feature_names)
+                }
+                reasoner.state_history = []
+                insights = reasoner.reason(sensor_dict, window=window)
+                active_rules = reasoner.get_active_learned_rule_names()
+                insight_count += 1
+            symbolic_score = None
+            problog_risk = None
+            predicted_rul = None
+            if matrix is not None and features:
+                columns = {
+                    name: float(matrix[position, index])
+                    for index, name in enumerate(features)
+                }
+                symbolic_score = columns.get('symbolic_rule_score')
+                problog_risk = columns.get('problog_failure_risk')
+                predicted_rul = columns.get('predicted_rul')
+            if (predicted_rul is None and rul_predictions is not None
+                    and len(rul_predictions) == len(scores)):
+                predicted_rul = float(rul_predictions[position])
+            trail.add(
+                split='test',
+                window_index=position,
+                unit=int(splits['test_units'][position]),
+                cycle=int(splits['test_cycles'][position]),
+                neural_probability=float(neural_scores[position]),
+                fused_probability=(
+                    float(scores[position]) if fusion_applied else None
+                ),
+                threshold=float(decision_threshold),
+                decision=int(scores[position] >= decision_threshold),
+                alert_mode=str(alert_mode),
+                alert_confirmed=bool(predictions[position]),
+                neural_threshold=float(
+                    evaluation.get('threshold', decision_threshold)
+                ),
+                symbolic_rule_score=symbolic_score,
+                problog_failure_risk=problog_risk,
+                predicted_rul=predicted_rul,
+                insights=insights,
+                active_rules=active_rules,
+                data_quality={
+                    'non_finite_values': int((~np.isfinite(window)).sum()),
+                    'drift_level': drift_level,
+                    'drift_score': drift_score,
+                },
+            )
+
+        journal = trail.flush()
+        return {
+            'enabled': True,
+            'journal_path': journal,
+            'records': trail.count,
+            'dropped_records': trail.dropped,
+            'run_id': run_id,
+            'versions': artifacts['versions'],
+            'hashes': artifacts['hashes'],
+            'thresholds': thresholds,
+            'alert_mode': str(alert_mode),
+        }
+
+    def _run_decision_analyses(
+            self, splits: Dict[str, Any], evaluation: Dict[str, Any],
+            val_scores: np.ndarray, test_scores: np.ndarray,
+            decision_threshold: float, fusion: Dict[str, Any]
+            ) -> Dict[str, Any]:
+        """Run the operational, sensitivity, fusion, drift and audit analyses.
+
+        Every analysis uses the validation split to make its decision and the
+        official test split only for reporting.
+        """
+        results_dir = self.config['paths']['results_dir']
+        analyses: Dict[str, Any] = {
+            'operational_policy': {},
+            'threshold_sensitivity': {},
+            'fusion_diagnostics': {},
+            'drift': {},
+            'audit': {},
+        }
+        alert_mode = 'immediate'
+
+        policy_config = self.config.get('operational_policy', {})
+        if policy_config.get('enabled', False):
+            policy_report = build_operational_policy_report(
+                splits['y_val'], val_scores, splits['val_units'],
+                splits['val_cycles'], splits['val_rul'],
+                splits['y_test'], test_scores, splits['test_units'],
+                splits['test_cycles'], splits['test_rul'],
+                decision_threshold, policy_config,
+            )
+            policy_path = save_operational_policy(
+                policy_report, os.path.join(results_dir, 'operational_policy.json')
+            )
+            alert_mode = policy_report['selected_mode']
+            analyses['operational_policy'] = {
+                'enabled': True,
+                'path': policy_path,
+                'selection_split': policy_report['selection_split'],
+                'selected_mode': alert_mode,
+                'selection_reason': policy_report['selection_reason'],
+                'threshold': policy_report['threshold'],
+                'rationale': policy_report['rationale'],
+                'validation': policy_report['validation'],
+                'test': policy_report['test'],
+            }
+            self.logger.info(
+                "Operational policy: %s selected on validation "
+                "(expected cost %.2f).", alert_mode,
+                policy_report['validation'][alert_mode]['expected_cost'],
+            )
+
+        sensitivity_config = self.config.get('threshold_sensitivity', {})
+        if sensitivity_config.get('enabled', False):
+            sensitivity = run_threshold_sensitivity(
+                splits['y_val'], val_scores, splits['val_units'],
+                splits['val_cycles'], splits['val_rul'],
+                splits['y_test'], test_scores, splits['test_units'],
+                splits['test_cycles'], splits['test_rul'],
+                self.config, results_dir,
+            )
+            analyses['threshold_sensitivity'] = {
+                'enabled': True,
+                'json_path': sensitivity['json_path'],
+                'csv_path': sensitivity['csv_path'],
+                'plot_path': sensitivity['plot_path'],
+                'candidate_count': len(sensitivity['candidates']),
+                'production_candidate': sensitivity['production_candidate'],
+                'grid': sensitivity['grid'],
+            }
+            self.logger.info(
+                "Threshold sensitivity: %d candidates written to %s.",
+                len(sensitivity['candidates']), sensitivity['csv_path'],
+            )
+
+        fusion_config = self.config.get('fusion', {})
+        diagnostics_config = fusion_config.get('validation', {})
+        val_matrix = fusion.get('val_matrix')
+        if (fusion.get('applied') and val_matrix is not None
+                and diagnostics_config.get('enabled', False)):
+            analyses['fusion_diagnostics'] = run_fusion_diagnostics(
+                val_matrix, splits['y_val'], splits['val_units'],
+                fusion.get('features', []), self.config, results_dir,
+            )
+            self.logger.info(
+                "Fusion diagnostics: %s",
+                analyses['fusion_diagnostics'].get('ablation_summary', {}).get(
+                    'answer'
+                ),
+            )
+
+        drift_config = self.config.get('monitoring', {}).get('drift', {})
+        if drift_config.get('enabled', False):
+            reference = reference_statistics(
+                splits['X_train'], self.feature_names
+            )
+            save_reference(
+                reference, os.path.join(results_dir, 'drift_reference.json')
+            )
+            drift_report = analyse_drift(
+                None, splits['X_test'], self.feature_names, drift_config,
+                label='official_test',
+                signals={
+                    'predicted_rul': evaluation.get(
+                        'rul_regression', {}
+                    ).get('test_predictions'),
+                    'neural_probability': evaluation.get('test_scores'),
+                    'fused_risk': test_scores,
+                },
+                reference=reference,
+            )
+            drift_path = save_drift_report(
+                drift_report, os.path.join(results_dir, 'drift_report.json')
+            )
+            analyses['drift'] = {
+                'enabled': True,
+                'path': drift_path,
+                'status': drift_report['status'],
+                'level': drift_report['level'],
+                'score': drift_report['score'],
+                'thresholds': drift_report['thresholds'],
+                'reference': drift_report['reference'],
+                'incoming_windows': drift_report['incoming']['windows'],
+                'non_finite_proportion': drift_report['incoming'][
+                    'non_finite_proportion'
+                ],
+                'feature_scores': drift_report['feature_scores'],
+                'warning_features': drift_report['warning_features'],
+                'critical_features': drift_report['critical_features'],
+                'signals': drift_report['signals'],
+                'hitl_recommended': drift_report['hitl_recommended'],
+                'recommendation': drift_report['recommendation'],
+            }
+            self.logger.info(
+                "Drift (%s): level=%s score=%.4f", drift_report['incoming'][
+                    'label'
+                ], drift_report['level'], drift_report['score'],
+            )
+
+        audit_config = self.config.get('audit', {})
+        if audit_config.get('enabled', False):
+            analyses['audit'] = self._write_decision_audit(
+                splits, evaluation, test_scores, decision_threshold,
+                fusion, alert_mode, analyses['drift'], audit_config,
+            )
+        return analyses
 
     def _run_cmapss(self) -> Dict[str, Any]:
         """Train and evaluate the FD001 model with an engine-level split."""
@@ -1580,6 +2044,10 @@ class ANSRDTPipeline:
         hitl_queue = self._build_hitl_queue(
             splits['X_test'], test_scores, decision_threshold
         )
+        analyses = self._run_decision_analyses(
+            splits, evaluation, val_scores, test_scores,
+            decision_threshold, fusion,
+        )
         if fusion.get('applied'):
             decision_section = {
                 'source': 'probability_fusion',
@@ -1602,7 +2070,7 @@ class ANSRDTPipeline:
 
         fusion_report = {
             key: value for key, value in fusion.items()
-            if key not in {'val_scores', 'test_scores'}
+            if key not in {'val_scores', 'test_scores', 'val_matrix', 'test_matrix'}
         }
         rul_report = {
             key: value for key, value in prepared['rul_report'].items()
@@ -1643,6 +2111,11 @@ class ANSRDTPipeline:
             'symbolic_rule_provenance': symbolic_provenance,
             'representative_windows': explanations,
             'hitl_queue': hitl_queue,
+            'operational_policy': analyses['operational_policy'],
+            'threshold_sensitivity': analyses['threshold_sensitivity'],
+            'fusion_diagnostics': analyses['fusion_diagnostics'],
+            'drift': analyses['drift'],
+            'audit': analyses['audit'],
             'artifacts': {
                 'model_path': model_path,
                 'scaler_path': scaler_path,
@@ -1667,6 +2140,20 @@ class ANSRDTPipeline:
                 'hitl_rule_validation_path': rule_validation_path,
                 'hitl_queue_csv': hitl_queue.get('csv_path'),
                 'hitl_queue_json': hitl_queue.get('json_path'),
+                'operational_policy_path': analyses[
+                    'operational_policy'
+                ].get('path'),
+                'threshold_sensitivity_path': analyses[
+                    'threshold_sensitivity'
+                ].get('json_path'),
+                'fusion_diagnostics_path': analyses[
+                    'fusion_diagnostics'
+                ].get('diagnostics_path'),
+                'fusion_ablation_path': analyses[
+                    'fusion_diagnostics'
+                ].get('ablation_path'),
+                'drift_report_path': analyses['drift'].get('path'),
+                'decision_audit_path': analyses['audit'].get('journal_path'),
             },
             'timestamp': datetime.now().isoformat(),
         }

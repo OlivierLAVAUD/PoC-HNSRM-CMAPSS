@@ -92,8 +92,37 @@ def _print_summary(summary: dict) -> None:
             )
 
 
+def _print_multi_seed_summary(report: dict) -> None:
+    """Print the headline of a multi-seed report."""
+    aggregate = report.get('aggregate', {})
+    print("\n=== ANSR-DT multi-seed ===")
+    print(f"Seeds: {report['protocol']['seeds']}")
+    for key in ('fusion_threshold', 'test_f1', 'test_recall',
+                'total_false_alarms', 'mean_anticipation_cycles',
+                'proportion_alerted_before_eol'):
+        stats = aggregate.get(key, {})
+        if stats.get('mean') is None:
+            continue
+        print(
+            f"  {key:<34} mean={stats['mean']:.4f} "
+            f"std={stats['std']:.4f} "
+            f"[{stats['min']:.4f}, {stats['max']:.4f}]"
+        )
+    leakage = report.get('leakage_check', {})
+    print(
+        f"  leakage check: ok={leakage.get('ok')} "
+        f"test_engines={leakage.get('test_engines')}"
+    )
+    artifacts = report.get('artifacts', {})
+    print(f"  report: {artifacts.get('report_path')}")
+    print(f"  csv:    {artifacts.get('summary_csv')}")
+    print(f"  plot:   {artifacts.get('plot_path')}")
+
+
 def main(clear: bool = False, compare_models: bool = False,
-         architecture: str = None) -> int:
+         architecture: str = None, multi_seed: bool = False,
+         seeds: str = None, threshold_sensitivity: bool = False,
+         operational_policy: bool = False) -> int:
     """Run the C-MAPSS pipeline and persist a run summary."""
     log_path = os.path.join(PROJECT_ROOT, 'logs', 'ansr_dt_main.log')
     os.makedirs(os.path.dirname(log_path), exist_ok=True)
@@ -107,10 +136,36 @@ def main(clear: bool = False, compare_models: bool = False,
         logger.info("Architecture overridden from CLI: %s", architecture)
 
     results_dir = _resolve(PROJECT_ROOT, config['paths'].get('results_dir', 'results'))
+    config['paths']['results_dir'] = results_dir
+    config['paths']['reasoning_rules_path'] = _resolve(
+        PROJECT_ROOT,
+        config['paths'].get('reasoning_rules_path', 'src/reasoning/rules.pl'),
+    )
     os.makedirs(results_dir, exist_ok=True)
     if clear:
         logger.warning("Clearing results directory: %s", results_dir)
         clear_results(results_dir)
+
+    if seeds or multi_seed:
+        logger.info("Multi-seed mode enabled.")
+        from src.experiments.multi_seed import parse_seeds, run_multi_seed
+
+        seed_list = parse_seeds(seeds, config)
+        config.setdefault('experiments', {}).setdefault(
+            'multi_seed', {}
+        )['enabled'] = True
+        report = run_multi_seed(
+            config, config_path, logger, seeds=seed_list,
+            results_dir=results_dir,
+        )
+        _print_multi_seed_summary(report)
+        logger.info("--- ANSR-DT multi-seed run finished ---")
+        return 0
+
+    if threshold_sensitivity:
+        config.setdefault('threshold_sensitivity', {})['enabled'] = True
+    if operational_policy:
+        config.setdefault('operational_policy', {})['enabled'] = True
 
     pipeline = ANSRDTPipeline(config, config_path, logger)
     results = pipeline.run(compare_models=True if compare_models else None)
@@ -136,9 +191,21 @@ if __name__ == '__main__':
                         help='Compare RandomForest and LightGBM on validation.')
     parser.add_argument('--architecture', choices=['random_forest', 'lightgbm'],
                         default=None, help='Override model.architecture.')
+    parser.add_argument('--multi-seed', action='store_true',
+                        help='Re-run the protocol over several split seeds.')
+    parser.add_argument('--seeds', default=None,
+                        help='Comma-separated seeds for --multi-seed (e.g. 42,43,44).')
+    parser.add_argument('--threshold-sensitivity', action='store_true',
+                        help='Sweep validation-selected decision thresholds.')
+    parser.add_argument('--operational-policy', action='store_true',
+                        help='Select the alert mode from maintenance costs.')
     args = parser.parse_args()
     sys.exit(main(
         clear=args.clear_results,
         compare_models=args.compare_models,
         architecture=args.architecture,
+        multi_seed=args.multi_seed,
+        seeds=args.seeds,
+        threshold_sensitivity=args.threshold_sensitivity,
+        operational_policy=args.operational_policy,
     ))

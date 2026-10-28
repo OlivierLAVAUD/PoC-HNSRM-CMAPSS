@@ -63,6 +63,12 @@ The neural model detects degradation from sliding windows. RandomForest remains 
 - **Learned-rule validation:** existing HITL rules are checked on validation windows before fusion, explanations and HITL queue construction. A rule must reach precision `>= 0.90`, support `>= 5` and false-positive rate `<= 0.05`; rejected rules are removed automatically. The report is `results/hitl_rule_validation.json`.
 - **Input quality:** NaN/Inf values in the train, validation and test splits are either replaced by zero (default) or rejected, controlled by `preprocessing.non_finite_policy`.
 - **Symbolic switch:** `symbolic_reasoning.enabled: false` skips the Prolog layer (temporal rules, learned-rule validation, explanations and rule-conflict HITL reasons); fusion then receives zero symbolic and ProbLog signals.
+- **Multi-seed validation:** `python main.py --multi-seed --seeds 42,43,44,45,46` re-splits the training engines per seed, re-derives the symbolic thresholds from that seed's own training engines, retrains, recalibrates, re-selects the neural and fusion thresholds on validation, refits the fusion and evaluates on the unchanged official test engines. It writes `results/multi_seed_report.json`, `results/multi_seed_summary.csv` and `results/visualization/multi_seed_distributions.png`; per-seed artifacts stay under `results/multi_seed/seed_<seed>/`.
+- **Threshold sensitivity:** `python main.py --threshold-sensitivity` sweeps `recall_at_precision` precision constraints, F-beta weights and F1, still selecting every threshold on validation only. Outputs `results/threshold_sensitivity.json`, `.csv` and `results/visualization/threshold_sensitivity.png`.
+- **Operational alert policy:** `python main.py --operational-policy` prices false negatives and false alarms (`operational_policy.false_negative_cost`, `false_alarm_cost`), compares immediate, consecutive and smoothed alerts, and selects a mode on validation. The decision and its rationale are written to `results/operational_policy.json`.
+- **Fusion robustness:** `fusion.validation` runs an engine-grouped cross-validation over the validation engines and an ablation study, reporting coefficient and threshold stability, relative input importance and the validation delta of removing each input (`results/fusion_diagnostics.json`, `results/fusion_ablation.json`). This is diagnostics only: the production fusion remains a single validation-fitted logistic model.
+- **Drift detection:** `monitoring.drift` compares incoming windows with training percentiles, bounds, NaN/Inf share and the predicted signal distributions, then reports `ok`, `warning` or `critical` in `results/drift_report.json`. A critical level never blocks inference: it warns and recommends routing the windows to the HITL queue.
+- **Decision audit:** every decided window gets a `decision_id`, artifact versions and SHA-256 digests (model, scaler, temporal metadata, `rules.pl`, `rules_learned.pl`, `prob_rules.pl`), both thresholds, the four fusion signals, the final decision and the data-quality context. The journal is `results/decision_audit.jsonl`; `python -m src.utils.audit --results results` verifies it.
 
 ## Dataset and labels
 
@@ -145,6 +151,24 @@ Controlled RandomForest vs LightGBM comparison (selection on validation only):
 python main.py --compare-models
 ```
 
+Robustness experiments and the operational decision (all selections stay on validation):
+
+```bash
+# Re-split the training engines for several seeds; official test untouched
+python main.py --multi-seed --seeds 42,43,44,45,46
+
+# Sweep validation-selected decision thresholds
+python main.py --threshold-sensitivity
+
+# Price false negatives against false alarms and pick an alert mode
+python main.py --operational-policy
+
+# Verify the audit trail of the last run
+python -m src.utils.audit --results results
+```
+
+The new analyses are also configurable: `experiments.multi_seed`, `threshold_sensitivity` and `operational_policy` are disabled by default and enabled by their flag (or with `enabled: true`), while `monitoring.drift`, `audit` and `fusion.validation` are enabled in `configs/config.yaml` and run with every normal pipeline run.
+
 The pipeline writes the run summary, metrics, calibration/threshold reports, alerting analysis, HITL queue and architecture-specific artifacts. Key files:
 
 - `results/final_run_results.json` and `results/cmapss_results.json`
@@ -161,6 +185,12 @@ The pipeline writes the run summary, metrics, calibration/threshold reports, ale
 - `results/models/temporal_features.joblib`, `results/models/lightgbm_rul_regressor.joblib` and `results/models/probability_fusion.joblib` (LightGBM path)
 - `results/scaler.pkl` (RandomForest path)
 - `results/visualization/*.png`
+- `results/operational_policy.json` (after `--operational-policy`)
+- `results/threshold_sensitivity.json`, `.csv` and `results/visualization/threshold_sensitivity.png` (after `--threshold-sensitivity`)
+- `results/multi_seed_report.json`, `results/multi_seed_summary.csv`, `results/visualization/multi_seed_distributions.png` and `results/multi_seed/seed_<seed>/` (after `--multi-seed`)
+- `results/fusion_diagnostics.json` and `results/fusion_ablation.json` (LightGBM fusion path)
+- `results/drift_reference.json` and `results/drift_report.json`
+- `results/decision_audit.jsonl`
 
 Evaluate the standalone ProbLog examples:
 
@@ -257,6 +287,25 @@ Most FD001 test trajectories never enter the `RUL <= 30` failure zone, hence the
 
 Consecutive confirmation removes isolated alerts at a small recall cost. Requiring three consecutive alerts gives the best precision in this run.
 
+### Multi-seed validation
+
+`python main.py --multi-seed --seeds 42,43,44,45,46` re-splits the 40 training engines five times (20 train / 20 validation per seed) while the official test split stays byte-identical across seeds (fingerprint `aac8a6c7…` in `results/multi_seed_report.json`). Aggregate over the five seeds:
+
+| Metric | Mean | Std | Min | Max |
+|---|---:|---:|---:|---:|
+| Neural threshold (validation-selected) | 0.0432 | 0.0189 | 0.0241 | 0.0733 |
+| Fusion threshold (validation-selected) | 0.1941 | 0.0815 | 0.0869 | 0.3084 |
+| Test F1 | 0.7522 | 0.0173 | 0.7305 | 0.7668 |
+| Test recall | 0.9386 | 0.0282 | 0.9187 | 0.9849 |
+| Test precision | 0.6280 | 0.0204 | 0.6064 | 0.6531 |
+| Test ROC-AUC | 0.9953 | 0.0013 | 0.9934 | 0.9970 |
+| Test Brier | 0.0100 | 0.0012 | 0.0080 | 0.0114 |
+| Engine mean recall | 0.9114 | 0.0404 | 0.8857 | 0.9822 |
+| Total false alarms | 185 | 16.5 | 162 | 198 |
+| Mean anticipation cycles | 29.40 | 0.30 | 29.08 | 29.84 |
+
+The chosen alert mode was `consecutive_3` for every seed. The main split sensitivity is in the fusion threshold (0.087–0.308 across seeds), which is why the threshold is re-selected on validation for every run rather than hard-coded. The 95% confidence intervals for each metric are in `results/multi_seed_report.json` (`aggregate.*.ci95_low/ci95_high`).
+
 ### Auxiliary RUL regression
 
 | Split | RMSE | MAE | Spearman |
@@ -316,6 +365,17 @@ Workflow:
 5. On the next pipeline run, learned rules are validated on held-out validation windows; rules that are too broad or imprecise are rejected.
 6. Validated rules are consulted by Prolog and injected into ProbLog with per-rule weight `0.15`, capped at `3` active learned rules.
 
+## Operational recommendation
+
+This section states the defaults supported by the current FD001 results, and what to review before changing them.
+
+- **Architecture:** LightGBM with explicit temporal features plus the validation-fitted probability fusion. It was selected over RandomForest on validation (`fbeta`), and the fusion improves test precision and false alarms at a known recall cost.
+- **Decision threshold:** do not hard-code a threshold across deployments. The official seed-42 split gives `0.2196` (`recall_at_precision` with `min_precision: 0.75`), but the multi-seed sweep shows the validation-selected fusion threshold varies between `0.0869` and `0.3084` depending on the training/validation split. Always re-run threshold selection on validation for a new split; the threshold sensitivity sweep (`results/threshold_sensitivity.csv`) shows the validation-selected thresholds remain within their precision constraints on test (e.g. `rec@0.75`: validation precision `0.7500` / test `0.6448`), so the lever works but precision itself degrades out of distribution.
+- **Alert mode:** `consecutive_3` (three consecutive alert-positives). Under the current cost assumption (`false_negative_cost: 10`, `false_alarm_cost: 1`) it has the lowest validation expected cost (296 vs 313 for immediate alerts), costs about `-0.10` cycles of mean anticipation and recovers precision from `0.7500` to `0.7755`. Re-run `python main.py --operational-policy` whenever the cost weights change: with a false-negative cost far above 10 the trade-off moves toward `smoothed_3` or immediate alerts.
+- **Human review triggers:** route a window to HITL when (a) its probability falls in the uncertainty band around the threshold, (b) the rule layer and the probability disagree (active rule with low probability, or high probability with no active rule), or (c) drift is at `critical`. At `warning` keep operating and watch the drift report over the next cycles; at `critical` stop reviewing only the affected windows on a best-effort basis — drift never blocks inference.
+- **Drift interpretation:** `ok` means incoming windows sit inside training bounds; `warning` (`shares within 5%–15%`) means out-of-bound features are below 15% of windows, and `critical` means out-of-bound rates or NaN/Inf rates exceed 15% — check data plumbing first, then assume an operating-condition shift and plan a recalibration on new labelled data. On the official FD001 test engines a non-`ok` level is expected (test trajectories run to failure while training trajectories are truncated), so judge drift on deployment traffic, not on the offline test run.
+- **Production metrics to watch:** recall and precision on labelled events, false alarms per engine and per cycle, calibration drift (Brier/ECE recomputed on any new labelled batch), mean anticipation, HITL queue rate per 1,000 windows and drift level. A rising HITL rate without a recall drop means the uncertainty band is drifting off-centre: re-select the threshold before retraining.
+
 ## Project layout
 
 ```text
@@ -328,26 +388,31 @@ src/
     core.py                       # perception -> symbols -> state
   data/
     cmapss_loader.py              # FD001 parquet/txt loader and windowing
-    data_loader.py                # legacy synthetic loader + factory
+    loader_factory.py             # picks the C-MAPSS loader for parquet/txt input
   evaluation/
     calibration.py                # Brier score, ECE, reliability curves
     thresholding.py               # validation-only threshold selection
     engine_metrics.py             # per-engine recall, false alarms, lead time
     alerting.py                   # consecutive confirmation and smoothing
+    operational_policy.py         # alert modes priced by maintenance cost
+  experiments/
+    multi_seed.py                 # per-seed protocol, aggregates, CSV, plot
+    threshold_sensitivity.py      # threshold grid, CSV/JSON, plot
   features/
     temporal_features.py          # explicit temporal statistics for LightGBM
   fusion/
     probability_fusion.py         # validation-only logistic fusion
+    diagnostics.py                # grouped CV, stability, ablation
   hitl/
     queue.py                      # uncertain/conflict queue, CSV/JSON export
     feedback.py                   # labels, learned rules, JSONL log, CLI
   inference/
     inference.py                  # legacy/raw C-MAPSS inference, optional fusion
-  integration/
-    adaptive_controller.py        # legacy synthetic-only controller (isolated)
   models/
     light_classifier.py           # RandomForest / MLP / LightGBM + calibration
     rul_regressor.py              # auxiliary LightGBM RUL and grouped OOF
+  monitoring/
+    drift.py                      # training reference vs incoming windows
   pipeline/
     pipeline.py                   # training, comparison, fusion, alerting, HITL
   reasoning/
@@ -359,21 +424,42 @@ src/
     temporal.py                   # train-only temporal features and thresholds
     rules_learned.pl              # rules learned from HITL feedback
   utils/
+    audit.py                      # decision ids, artifact hashes, JSONL, CLI
     model_utils.py                # scaler and model persistence
-tests/                            # 106 unit and integration tests
+legacy/
+  synthetic_data_loader.py        # .npz synthetic loader (not FD001)
+  adaptive_controller.py          # synthetic-only control loop (not FD001)
+  data/                           # synthetic .npz sample used by the legacy path
+tests/                            # 177 unit and integration tests
 results/                          # generated artifacts (ignored by git)
 ```
 
+### Legacy modules
+
+The `legacy/` package is not part of the C-MAPSS FD001 pipeline. These modules
+are kept only so the synthetic demonstration path and its tests keep working:
+
+- `legacy/synthetic_data_loader.py`: loader for the synthetic `.npz` sample
+  (inputs `temperature`, `vibration`, `pressure`, `efficiency_index`, ...);
+- `legacy/adaptive_controller.py`: the synthetic control loop;
+- `legacy/data/synthetic_sensor_data_with_anomalies.npz`: the sample file.
+
+These modules are not imported by `main.py`, the FD001 pipeline, the fusion, the
+monitoring layer or the inference path used on C-MAPSS files. `src/data/loader_factory.py`
+still falls back to `legacy.synthetic_data_loader.DataLoader` when
+`paths.data_file` does not point at a parquet or text file, which is the only
+remaining link and is exercised by `tests/test_data_loader.py`.
+
 ## Testing
 
-The suite covers the C-MAPSS loader, RandomForest/LightGBM classifiers, calibration, thresholding, engine metrics, temporal features, RUL regression, alert confirmation, probability fusion, config validation, learned-rule validation, symbolic-threshold provenance, the published README metrics, ProbLog, the pipeline, inference, the HITL queue and HITL feedback:
+The suite covers the C-MAPSS loader, RandomForest/LightGBM classifiers, calibration, thresholding, engine metrics, temporal features, RUL regression, alert confirmation, probability fusion, config validation, learned-rule validation, symbolic-threshold provenance, the published README metrics, ProbLog, the pipeline, inference, the HITL queue and HITL feedback. The new analyses have their own tests: `test_multi_seed.py`, `test_threshold_sensitivity.py`, `test_operational_policy.py`, `test_fusion_diagnostics.py`, `test_drift.py`, `test_audit.py` and `test_pipeline_analyses.py`.
 
 ```bash
 $env:Path = "C:\Program Files\swipl\bin;$env:Path"
 python -m unittest discover -s tests -q
 ```
 
-Expected result: `106 tests ... OK`. The FD001 threshold, provenance and classifier tests, plus the README metric check, are skipped when the parquet or run artifacts are missing.
+Expected result: `177 tests ... OK`. The FD001 threshold, provenance and classifier tests, plus the README metric check, are skipped when the parquet or run artifacts are missing; the symbolic tests are skipped when SWI-Prolog is not available.
 
 ## Limitations
 
@@ -387,7 +473,12 @@ Expected result: `106 tests ... OK`. The FD001 threshold, provenance and classif
 - HITL feedback can add symbolic and ProbLog rules, but it does not retrain the neural classifier.
 - Temporal thresholds are fitted on training windows; learned-rule validation uses validation data. Neither is tuned on the official test set.
 - No RL, control actions, LLM reasoning, GraphRAG or Neo4j.
-- `AdaptiveController` is legacy synthetic-only code and is isolated from the FD001 pipeline.
+- Multi-seed validation only re-splits the 40 training engines: five seeds give 20 training and 20 validation engines each. It measures split sensitivity, not a different dataset.
+- The fusion diagnostics use engine-grouped cross-validation on the 20 validation engines, so fold estimates are coarse (four engines per held-out fold) and only detect large effects.
+- Drift on the official test engines is legitimately different from training: FD001 test trajectories run to failure while the training trajectories are truncated, so a non-`ok` drift level there is expected and is not a defect.
+- The decision audit journal stores one compact record per decided window, with symbolic insights only for the riskiest windows (`audit.include_insights`). It is an audit trail, not a full provenance database.
+- The operational cost weights (`false_negative_cost`, `false_alarm_cost`) are configurable assumptions, not measured maintenance costs.
+- `AdaptiveController` is legacy synthetic-only code, now under `legacy/`, isolated from the FD001 pipeline.
 - Data files are not distributed with the repository.
 - This is a research proof of concept, not a production digital twin.
 

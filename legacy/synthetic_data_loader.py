@@ -1,9 +1,18 @@
-# src/data/data_loader.py
+"""Synthetic ``.npz`` data loader (legacy).
+
+This loader belongs to the original synthetic demonstration
+(``temperature``, ``vibration``, ``pressure``, ``efficiency_index``,
+``operational_hours``, ``system_state``, ``performance_score``). It is not
+part of the C-MAPSS FD001 pipeline and is kept only so the legacy
+``_run_legacy`` path and its tests keep working.
+"""
+
+import logging
+from typing import Tuple
 
 import numpy as np
-import logging
-import os
-from typing import Tuple
+
+LEGACY_ONLY = True
 
 class DataLoader:
     def __init__(self, data_file: str, window_size: int = 10):
@@ -128,21 +137,3 @@ class DataLoader:
         except Exception as e:
             self.logger.error(f"Failed to split data: {e}")
             raise
-
-
-def create_data_loader(data_file: str, window_size: int, feature_names=None,
-                       test_file: str = None, rul_file: str = None,
-                       logger=None, rul_threshold: int = 30):
-    """Return a CMAPSS loader for parquet/text data, else the synthetic loader."""
-    if data_file.lower().endswith(('.parquet', '.txt')):
-        from src.data.cmapss_loader import CMAPSSLoader
-        return CMAPSSLoader(
-            data_file,
-            window_size=window_size,
-            feature_names=feature_names,
-            test_file=test_file or None,
-            rul_file=rul_file or None,
-            rul_threshold=rul_threshold,
-            logger=logger,
-        )
-    return DataLoader(data_file, window_size=window_size)

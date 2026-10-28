@@ -64,15 +64,22 @@ EXAMPLES = {
 }
 
 
-def extract_conditions(sensor_values):
-    """Map raw sensors to deterministic HPC conditions used by ProbLog."""
+def extract_conditions(sensor_values, thresholds=None):
+    """Map raw sensors to deterministic HPC conditions used by ProbLog.
+
+    ``thresholds`` defaults to the named facts of the packaged ``rules.pl``.
+    A caller that reasons with a different rule file (for example a per-seed
+    copy produced by a multi-seed run) must pass its own thresholds so the
+    evidence stays consistent with the symbolic layer.
+    """
+    values = THRESHOLDS if thresholds is None else thresholds
     return {
-        'hpc_temp_elevated': sensor_values['s4'] > THRESHOLDS['s4_elevated'],
-        'hpc_temp_critical': sensor_values['s4'] > THRESHOLDS['s4_critical'],
-        'hpc_static_pressure_high': sensor_values['s11'] > THRESHOLDS['s11_high'],
-        'hpc_outlet_pressure_low': sensor_values['s7'] < THRESHOLDS['s7_low'],
-        'fuel_flow_low': sensor_values['s12'] < THRESHOLDS['s12_low'],
-        'coolant_bleed_low': sensor_values['s21'] < THRESHOLDS['s21_low'],
+        'hpc_temp_elevated': sensor_values['s4'] > values['s4_elevated'],
+        'hpc_temp_critical': sensor_values['s4'] > values['s4_critical'],
+        'hpc_static_pressure_high': sensor_values['s11'] > values['s11_high'],
+        'hpc_outlet_pressure_low': sensor_values['s7'] < values['s7_low'],
+        'fuel_flow_low': sensor_values['s12'] < values['s12_low'],
+        'coolant_bleed_low': sensor_values['s21'] < values['s21_low'],
     }
 
 
@@ -101,7 +108,8 @@ def _normalise_learned_rules(learned_rules):
 
 
 def evaluate_state(base_program, sensor_values, learned_rules=None,
-                   learned_rule_weight=0.15, max_active_learned_rules=3):
+                   learned_rule_weight=0.15, max_active_learned_rules=3,
+                   hpc_thresholds=None):
     """Append evidence for one state and evaluate failure-risk queries.
 
     Active learned HITL rules are injected as independent probabilistic facts
@@ -110,7 +118,7 @@ def evaluate_state(base_program, sensor_values, learned_rules=None,
     ``1 - (1 - w)**n``. A single rule therefore cannot dominate the final risk,
     and ``max_active_learned_rules`` bounds the total contribution.
     """
-    conditions = extract_conditions(sensor_values)
+    conditions = extract_conditions(sensor_values, hpc_thresholds)
     evidence = [name for name, active in conditions.items() if active]
     program = base_program + '\n' + ''.join(f'{name}.\n' for name in evidence)
 

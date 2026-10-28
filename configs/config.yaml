@@ -152,6 +152,36 @@ experiments:
     selection_metric: "fbeta"      # f1 | fbeta | recall | average_precision | roc_auc
     beta: 2.0
     selection_split: validation
+  # Re-run the whole protocol over several train/validation splits of the
+  # training engines. The official test engines stay untouched. Enable with
+  # `python main.py --multi-seed --seeds 42,43,44,45,46`.
+  multi_seed:
+    enabled: false
+    seeds: [42, 43, 44, 45, 46]
+    selection_metric: "fbeta"
+    beta: 2.0
+
+# ===============================
+# Threshold Sensitivity Analysis
+# ===============================
+threshold_sensitivity:
+  enabled: false                 # enable with `python main.py --threshold-sensitivity`
+  min_precision_values: [0.65, 0.70, 0.75, 0.80, 0.85]
+  beta_values: [1.0, 1.5, 2.0, 3.0]
+  strategies: ["recall_at_precision", "fbeta", "f1"]
+
+# ===============================
+# Operational Alert Policy
+# ===============================
+# Expected maintenance cost per alert mode. The mode is selected on validation
+# only; the official test split is reported for information.
+operational_policy:
+  enabled: false                 # enable with `python main.py --operational-policy`
+  false_negative_cost: 10.0
+  false_alarm_cost: 1.0
+  inspection_capacity_per_cycle: null   # max inspections per engine-cycle
+  selection_metric: "expected_cost"      # expected_cost | fbeta | recall
+  preferred_alert_mode: null             # immediate | consecutive_2 | ...
 
 # ===============================
 # Alert Confirmation and Smoothing
@@ -190,12 +220,50 @@ fusion:
   fallback: 0.5
   features: ["neural_probability", "symbolic_rule_score",
              "problog_failure_risk", "predicted_rul"]
+  # Robustness check of the production fusion: grouped cross-validation over
+  # the validation engines (never the official test engines). Diagnostics only.
+  validation:
+    enabled: true
+    method: "group_kfold"         # group_kfold | repeated_kfold
+    n_splits: 5
+    n_repeats: 1
+    random_state: 42
+
+# ===============================
+# Monitoring
+# ===============================
+# Compare incoming windows with training statistics. A critical drift never
+# blocks inference: it warns and suggests routing windows to the HITL queue.
+monitoring:
+  drift:
+    enabled: true
+    warning_threshold: 0.05       # share of incoming values outside training bounds
+    critical_threshold: 0.15
+    min_windows: 30
+
+# ===============================
+# Decision Audit Trail
+# ===============================
+# One JSONL record per decided window, with artifact hashes and signals.
+# Verify a run with `python -m src.utils.audit --results results`.
+audit:
+  enabled: true
+  max_records: 12000            # cap on written decisions (0 = no cap)
+  include_insights: 25          # symbolic insights kept for the riskiest windows
 
 # ===============================
 # Engine-level Evaluation
 # ===============================
 engine_metrics:
   enabled: true
+
+# ===============================
+# Legacy modules
+# ===============================
+# src/data/data_loader.py and src/integration/adaptive_controller.py belong to
+# the synthetic demonstration and are not part of the FD001 pipeline.
+legacy:
+  enabled: false
 
 # ===============================
 # Input Data Quality
