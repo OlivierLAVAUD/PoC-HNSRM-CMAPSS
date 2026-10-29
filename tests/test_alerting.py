@@ -65,6 +65,16 @@ class TestAlerting(unittest.TestCase):
                 np.array([1, 1]), np.array([1]), np.array([1, 2]), k=2
             )
 
+    def test_smoothed_predictions_ignores_first_windows(self):
+        """Les window-1 premières fenêtres de chaque moteur n'ont pas assez
+        d'historique pour une moyenne mobile : elles ne sont pas prédites."""
+        scores = np.array([0.9, 0.9, 0.9, 0.9])
+        units = np.array([1, 1, 1, 1])
+        cycles = np.array([1, 2, 3, 4])
+        pred = smoothed_predictions(scores, units, cycles, 0.5, window=3)
+        # Les 2 premières fenêtres n'ont pas assez d'historique (window=3)
+        np.testing.assert_array_equal(pred, np.array([0, 0, 1, 1]))
+
 
 if __name__ == '__main__':
     unittest.main()

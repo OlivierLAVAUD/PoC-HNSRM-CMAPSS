@@ -41,6 +41,29 @@ model:
     reg_lambda: 0.0
     class_weight: "balanced"
 
+# Sequential CNN-LSTM + Attention architecture. Select with
+# model.architecture: "cnn_lstm" or `python main.py --architecture cnn_lstm`.
+# Requires TensorFlow.
+  cnn_lstm:
+    input_shape: [30, 14]
+    learning_rate: 0.001
+    use_attention: true
+    attention_key_dim: 50
+    attention_heads: 4
+    cnn_filters: 64
+    cnn_kernel_size: 3
+    lstm_units: 64
+    dropout: 0.2
+    epochs: 30
+    batch_size: 32
+    patience: 5
+
+# Knowledge graph (optional, requires networkx + matplotlib). Disabled by
+# default; enable with knowledge_graph.enabled: true to render
+# results/knowledge_graph.png for each run.
+knowledge_graph:
+  enabled: false
+
 # ===============================
 # Probability Calibration
 # ===============================

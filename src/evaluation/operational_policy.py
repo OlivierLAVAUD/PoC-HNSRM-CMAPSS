@@ -242,10 +242,14 @@ def _rationale(selected: str, validation: Dict[str, Dict[str, Any]],
     lead_delta = float(
         chosen['mean_lead_time_cycles'] - immediate['mean_lead_time_cycles']
     )
+    if false_alarm_cost > 0:
+        ratio_str = f"{false_negative_cost / false_alarm_cost:.1f}"
+    else:
+        ratio_str = "inf (false_alarm_cost=0)"
     reasons = [
         (
             f"false negatives cost {false_negative_cost:g}x a false alarm "
-            f"(ratio {_safe_div(false_negative_cost, max(false_alarm_cost, 1e-12)):.1f})"
+            f"(ratio {ratio_str})"
         ),
         (
             f"{selected} expected validation cost "

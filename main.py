@@ -189,7 +189,7 @@ if __name__ == '__main__':
                         help='Clear the results directory before running.')
     parser.add_argument('--compare-models', action='store_true',
                         help='Compare RandomForest and LightGBM on validation.')
-    parser.add_argument('--architecture', choices=['random_forest', 'lightgbm'],
+    parser.add_argument('--architecture', choices=['random_forest', 'lightgbm', 'cnn_lstm'],
                         default=None, help='Override model.architecture.')
     parser.add_argument('--multi-seed', action='store_true',
                         help='Re-run the protocol over several split seeds.')

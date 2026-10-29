@@ -2,13 +2,20 @@
 
 This repository is a lightweight **hybrid neuro-symbolic reasoning and monitoring (HNSRM)** proof of concept built on NASA C-MAPSS **FD001**. It keeps the core idea of ANSR-DT, neural perception followed by explicit symbolic and probabilistic reasoning, while removing the heavy components from the original framework.
 
-The following are intentionally out of scope in this PoC:
+## Périmètre
 
-- GraphRAG, Neo4j and knowledge-graph storage
-- LLM-based decision making
-- PPO/RL and control policies
-- SKAB and the synthetic digital-twin data path
-- TensorFlow and CNN-LSTM models
+Ce PoC se concentre sur la **détection d'anomalie tabulaire + raisonnement
+symbolique + HITL** sur FD001. Par rapport à ANSR-DT original :
+
+- **Retiré** : CNN-LSTM (remplacé par RF/LightGBM + features temporelles
+  explicites), PPO/contrôle (FD001 n'a pas de boucle de contrôle),
+  Knowledge Graph, path SKAB natif.
+- **Ajouté** : calibration, seuil de décision validation-only, fusion
+  logistique, provenance symbolique bloquante, validation des règles HITL,
+  audit trail, dérive (drift), multi-seed, sensibilité au seuil, politique
+  opérationnelle.
+
+GraphRAG, LLM et Neo4j ne sont présents dans aucune des deux versions.
 
 ## Pipeline
 

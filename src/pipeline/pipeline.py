@@ -1700,6 +1700,18 @@ class ANSRDTPipeline:
         drift_level = drift.get('level') if drift else None
         drift_score = drift.get('score') if drift else None
 
+        kg = None
+        try:
+            if bool(self.config.get('knowledge_graph', {}).get('enabled', False)):
+                from src.reasoning.knowledge_graph import (
+                    KnowledgeGraphGenerator,
+                )
+                kg = KnowledgeGraphGenerator(logger=self.logger)
+        except Exception as error:  # pragma: no cover - optional KG
+            self.logger.warning(
+                "Knowledge graph initialisation failed: %s", error
+            )
+
         for raw_index in order:
             position = int(raw_index)
             window = splits['X_test'][position]
@@ -1714,6 +1726,31 @@ class ANSRDTPipeline:
                 insights = reasoner.reason(sensor_dict, window=window)
                 active_rules = reasoner.get_active_learned_rule_names()
                 insight_count += 1
+            if kg is not None:
+                try:
+                    current_state = {
+                        name: float(window[-1, index])
+                        for index, name in enumerate(self.feature_names)
+                    }
+                    current_state['system_state'] = int(
+                        predictions[position]
+                    )
+                    rules_list = [
+                        {'rule': r, 'confidence': 1.0} for r in active_rules
+                    ]
+                    anomalies = {
+                        'severity': int(predictions[position]),
+                        'confidence': float(
+                            scores[position] if scores is not None else 0.0
+                        ),
+                    }
+                    kg.update_graph(
+                        current_state, insights, rules_list, anomalies
+                    )
+                except Exception as error:  # pragma: no cover - optional KG
+                    self.logger.warning(
+                        "Knowledge graph update failed: %s", error
+                    )
             symbolic_score = None
             problog_risk = None
             predicted_rul = None
@@ -1755,6 +1792,15 @@ class ANSRDTPipeline:
                     'drift_score': drift_score,
                 },
             )
+
+        if kg is not None:
+            try:
+                kg_path = os.path.join(results_dir, 'knowledge_graph.png')
+                kg.visualize(kg_path, plot_type='focused_ieee')
+            except Exception as error:  # pragma: no cover - optional KG
+                self.logger.warning(
+                    "Knowledge graph visualization failed: %s", error
+                )
 
         journal = trail.flush()
         return {

@@ -1062,6 +1062,103 @@ class SymbolicReasoner:
         self.logger.debug(f"Reasoning complete. Generated {len(insights)} insights.")
         return insights
 
+    def extract_rules_from_neural_model(
+        self,
+        model: Any,
+        input_data: np.ndarray,
+        feature_names: List[str],
+        threshold: float = 0.6,
+    ) -> List[Tuple[str, float]]:
+        """Extract symbolic threshold rules from a fitted neural/tabular model.
+
+        For tree-based estimators (RandomForest, etc.) this walks the decision
+        nodes and turns each ``(feature, threshold)`` split into a Prolog rule
+        of the form::
+
+            hpc_neural_<sensor>_high :- sensor_<sensor>(V), V > <threshold>.
+
+        The rules are asserted into the Prolog knowledge base so they are
+        immediately available to :meth:`reason`, and returned as
+        ``(rule_string, confidence)`` pairs for :meth:`update_rules`.
+
+        Returns an empty list when the model exposes no inspectable structure
+        (e.g. a black-box Keras model) or when extraction fails.
+        """
+        rules: List[Tuple[str, float]] = []
+        try:
+            estimator = getattr(model, "model", model)
+            base_estimator = getattr(estimator, "base_estimator_", None)
+            if base_estimator is not None:
+                estimator = base_estimator
+            estimators = getattr(estimator, "estimators_", None)
+            if estimators is None:
+                single = getattr(estimator, "tree_", None)
+                estimators = [single] if single is not None else []
+            if not estimators:
+                return rules
+            seen_bodies: set = set()
+            for tree in estimators:
+                if tree is None:
+                    continue
+                tree_ = tree.tree_ if hasattr(tree, "tree_") else tree
+                n_nodes = int(tree_.node_count)
+                children_left = tree_.children_left
+                children_right = tree_.children_right
+                feature = tree_.feature
+                threshold_arr = tree_.threshold
+                for node_id in range(n_nodes):
+                    if children_left[node_id] == children_right[node_id]:
+                        continue  # leaf
+                    fid = int(feature[node_id])
+                    if fid < 0 or fid >= len(feature_names):
+                        continue
+                    thr = float(threshold_arr[node_id])
+                    if math.isnan(thr) or math.isinf(thr):
+                        continue
+                    name = str(feature_names[fid])
+                    safe = re.sub(r"[^a-zA-Z0-9_]", "_", name)
+                    head = f"hpc_neural_{safe}_high"
+                    body = f"sensor_{safe}(V), V > {thr:.6f}"
+                    rule_string = f"{head} :- {body}."
+                    if body in seen_bodies:
+                        continue
+                    seen_bodies.add(body)
+                    # Assert into the live Prolog KB so reason() can fire it.
+                    try:
+                        self.prolog.assertz(rule_string)
+                    except Exception:
+                        pass
+                    confidence = float(min(0.95, float(threshold) + 0.1))
+                    rules.append((rule_string, confidence))
+            self.logger.info(
+                "Extracted %d neural threshold rules from %d estimator(s).",
+                len(rules), len(estimators),
+            )
+        except Exception as error:
+            self.logger.warning(
+                "extract_rules_from_neural_model failed: %s", error
+            )
+        return rules
+
+    def analyze_neural_patterns(
+        self,
+        model: Any,
+        input_data: np.ndarray,
+        feature_names: List[str],
+        threshold: float = 0.6,
+    ) -> List[Tuple[str, float]]:
+        """Convenience wrapper around :meth:`extract_rules_from_neural_model`.
+
+        Kept for API compatibility with the original ANSR-DT rule-extraction
+        path. Returns ``(rule_string, confidence)`` pairs.
+        """
+        return self.extract_rules_from_neural_model(
+            model=model,
+            input_data=input_data,
+            feature_names=feature_names,
+            threshold=threshold,
+        )
+
     def get_rule_statistics(self) -> Dict[str, Any]:
         """Retrieve statistics about the current rule base (base + learned in memory)."""
         num_base_rules_queried = 10

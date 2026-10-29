@@ -11,6 +11,8 @@ from sklearn.ensemble import RandomForestClassifier
 from sklearn.model_selection import StratifiedKFold
 from sklearn.neural_network import MLPClassifier
 
+from src.models.keras_adapter import KerasSklearnAdapter
+
 
 class LightClassifier:
     """Lightweight sklearn classifier for windowed sensor data.
@@ -84,6 +86,32 @@ class LightClassifier:
             if params["subsample"] < 1.0:
                 params["subsample_freq"] = 1
             return LGBMClassifier(**params)
+        if name in ("cnn_lstm", "cnn-lstm"):
+            from src.models.cnn_lstm_model import create_cnn_lstm_model
+
+            input_shape = kwargs.get("input_shape")
+            if input_shape is None:
+                raise ValueError(
+                    "cnn_lstm architecture requires input_shape=(window_size, n_features) "
+                    "in model configuration."
+                )
+            keras_model = create_cnn_lstm_model(
+                input_shape=tuple(input_shape),
+                learning_rate=float(kwargs.get("learning_rate", 0.001)),
+                use_attention=bool(kwargs.get("use_attention", True)),
+                attention_key_dim=int(kwargs.get("attention_key_dim", 50)),
+                attention_heads=int(kwargs.get("attention_heads", 4)),
+                cnn_filters=int(kwargs.get("cnn_filters", 64)),
+                cnn_kernel_size=int(kwargs.get("cnn_kernel_size", 3)),
+                lstm_units=int(kwargs.get("lstm_units", 64)),
+                dropout=float(kwargs.get("dropout", 0.2)),
+            )
+            return KerasSklearnAdapter(
+                model=keras_model,
+                epochs=int(kwargs.get("epochs", 30)),
+                batch_size=int(kwargs.get("batch_size", 32)),
+                patience=int(kwargs.get("patience", 5)),
+            )
         raise ValueError(f"Unsupported light classifier architecture: {architecture}")
 
     def _flatten(self, X: np.ndarray) -> np.ndarray:
@@ -100,15 +128,48 @@ class LightClassifier:
             return X
         raise ValueError(f"Expected 2D or 3D input, got shape {X.shape}")
 
+    def _is_sequential(self) -> bool:
+        """Return True when the architecture consumes raw 3D windows."""
+        return str(self.architecture).lower() in ("cnn_lstm", "cnn-lstm")
+
     def fit(self, X: np.ndarray, y: np.ndarray) -> "LightClassifier":
-        """Fit the classifier on windowed sensor data."""
-        X_flat = self._flatten(X)
-        self.n_features = X_flat.shape[1]
-        if np.asarray(X).ndim == 3:
-            self.window_size = np.asarray(X).shape[1]
-        self.model.fit(X_flat, np.asarray(y).ravel())
-        self.logger.info("LightClassifier fitted on %d samples with %d features.", X_flat.shape[0], X_flat.shape[1])
+        """Fit the classifier on windowed sensor data.
+
+        Sequential architectures (CNN-LSTM) consume raw 3D windows
+        ``(batch, window, features)`` directly; tabular architectures flatten
+        them to ``(batch, window * features)``.
+        """
+        array = np.asarray(X, dtype=np.float32)
+        if not np.isfinite(array).all():
+            raise ValueError(
+                "LightClassifier received NaN or infinite values. "
+                "Apply the configured data_quality policy before training."
+            )
+        if self._is_sequential():
+            if array.ndim != 3:
+                raise ValueError(
+                    f"Sequential architecture '{self.architecture}' expects 3D "
+                    f"windows (batch, window, features), got shape {array.shape}."
+                )
+            self.window_size = int(array.shape[1])
+            self.n_features = int(array.shape[2])
+            self.model.fit(array, np.asarray(y).ravel())
+            n_samples, n_feat = array.shape[0], array.shape[1] * array.shape[2]
+        else:
+            X_flat = self._flatten(array)
+            self.n_features = X_flat.shape[1]
+            if array.ndim == 3:
+                self.window_size = int(array.shape[1])
+            self.model.fit(X_flat, np.asarray(y).ravel())
+            n_samples, n_feat = X_flat.shape
+        self.logger.info(
+            "LightClassifier fitted on %d samples with %d features (%s).",
+            n_samples,
+            n_feat,
+            self.architecture,
+        )
         return self
+
 
     def calibrate(self, X: np.ndarray, y: np.ndarray, method: str = "sigmoid",
                   cv_folds: int = 5) -> "LightClassifier":
@@ -118,7 +179,18 @@ class LightClassifier:
         sees the official test set. ``sigmoid`` is the safer default for the
         small, imbalanced FD001 training split; ``isotonic`` is available when
         enough samples are present.
+
+        Sequential architectures (CNN-LSTM) are not wrapped in
+        ``CalibratedClassifierCV`` (Keras models are not scikit-learn clonable);
+        rely on the validation-selected decision threshold instead.
         """
+        if self._is_sequential():
+            self.logger.warning(
+                "Calibration skipped for sequential architecture '%s'; using "
+                "the validation-selected decision threshold instead.",
+                self.architecture,
+            )
+            return self
         method = str(method).lower()
         if method not in {"sigmoid", "isotonic"}:
             raise ValueError(f"Unsupported calibration method: {method!r}")
@@ -174,8 +246,15 @@ class LightClassifier:
         return (self.positive_proba(X) >= threshold).astype(int)
 
     def predict_proba(self, X: np.ndarray) -> np.ndarray:
-        """Return class probabilities with columns aligned to ``self.classes_``."""
-        return self.model.predict_proba(self._flatten(X))
+        """Return class probabilities with columns aligned to ``self.classes_``.
+
+        Sequential architectures receive raw 3D windows; tabular architectures
+        receive flattened windows.
+        """
+        array = np.asarray(X, dtype=np.float32)
+        if self._is_sequential():
+            return self.model.predict_proba(array)
+        return self.model.predict_proba(self._flatten(array))
 
     def positive_proba(self, X: np.ndarray) -> np.ndarray:
         """Return the probability of the positive (failure) class."""

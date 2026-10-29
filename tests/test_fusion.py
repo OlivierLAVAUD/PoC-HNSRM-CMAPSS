@@ -10,7 +10,9 @@ from src.fusion.probability_fusion import (
     ProbabilityFusion,
     evaluate_probability_fusion,
     symbolic_rule_score,
+    _SEVERITY_WEIGHTS,
 )
+from src.reasoning.reasoning import PYSWIP_AVAILABLE
 
 
 class TestProbabilityFusion(unittest.TestCase):
@@ -24,6 +26,25 @@ class TestProbabilityFusion(unittest.TestCase):
         self.assertLessEqual(
             symbolic_rule_score(['critical'] * 50), 1.0
         )
+
+    @unittest.skipUnless(PYSWIP_AVAILABLE, "SWI-Prolog/PySWIP not available")
+    def test_severity_weights_cover_all_emitted_insights(self):
+        """Chaque insight émis par le reasoner doit avoir un poids de sévérité."""
+        from src.reasoning.prob_query import EXAMPLES, RULES_PATH
+        from src.reasoning.reasoning import SymbolicReasoner
+
+        reasoner = SymbolicReasoner(RULES_PATH, (30, 14), model=None)
+        emitted = set()
+        for state in EXAMPLES.values():
+            emitted.update(reasoner.reason(state))
+
+        keywords = {kw for kw, _ in _SEVERITY_WEIGHTS}
+        for insight in emitted:
+            text = insight.lower()
+            self.assertTrue(
+                any(kw in text for kw in keywords),
+                f"Insight sans poids de sévérité : {insight!r}",
+            )
 
     def test_build_matrix_respects_configured_order(self):
         matrix = ProbabilityFusion.build_matrix(

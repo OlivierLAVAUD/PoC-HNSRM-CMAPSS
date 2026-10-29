@@ -60,14 +60,20 @@ class ProbabilityFusion:
 
     def __init__(self, random_state: int = 42,
                  feature_order: Optional[Iterable[str]] = None,
-                 logger: Optional[logging.Logger] = None):
+                 logger: Optional[logging.Logger] = None,
+                 C: float = 0.1,
+                 penalty: str = "l2"):
         self.random_state = int(random_state)
         self.feature_order = list(feature_order or DEFAULT_FEATURES)
         self.logger = logger or logging.getLogger(__name__)
+        self.C = float(C)
+        self.penalty = str(penalty)
         self.scaler = StandardScaler()
         self.model = LogisticRegression(
             class_weight="balanced", max_iter=1000,
             random_state=self.random_state,
+            C=self.C,
+            penalty=self.penalty,
         )
         self.is_fitted = False
 

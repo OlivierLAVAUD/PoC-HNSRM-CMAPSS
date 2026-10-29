@@ -180,6 +180,16 @@ class HITLQueue:
         case.reviewed_at = datetime.now().isoformat()
         return case
 
+    def _ordered_cases(self) -> List[HITLCase]:
+        """Return cases sorted by queue priority then descending probability."""
+        return sorted(
+            self.cases,
+            key=lambda c: (
+                REASON_PRIORITY.get(c.reason, 99),
+                -c.neural_probability,
+            ),
+        )
+
     def export_csv(self, path: Optional[str] = None) -> str:
         """Write all cases to a flat CSV file."""
         target = path or self.csv_path
@@ -195,7 +205,7 @@ class HITLQueue:
         with open(target, 'w', newline='') as file:
             writer = csv.DictWriter(file, fieldnames=fields)
             writer.writeheader()
-            for case in self.cases:
+            for case in self._ordered_cases():
                 row = asdict(case)
                 row['insights'] = '|'.join(case.insights)
                 row['sensor_values'] = json.dumps(case.sensor_values)
@@ -216,7 +226,7 @@ class HITLQueue:
                 'max_cases': self.max_cases,
                 'exported_at': datetime.now().isoformat(),
             },
-            'cases': [asdict(case) for case in self.cases],
+            'cases': [asdict(case) for case in self._ordered_cases()],
         }
         with open(target, 'w') as file:
             json.dump(payload, file, indent=2)

@@ -8,3 +8,4 @@ pyswip>=0.3.3
 problog>=2.3.0
 pyyaml>=6.0
 matplotlib>=3.7
+networkx>=3.0

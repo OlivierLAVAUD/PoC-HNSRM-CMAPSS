@@ -67,13 +67,28 @@ class TestHITLQueueAndFeedback(unittest.TestCase):
         with open(csv_path, newline='') as file:
             rows = list(csv.DictReader(file))
         self.assertEqual(len(rows), 5)
-        self.assertEqual(rows[0]['case_id'], 'case_0001')
-        self.assertEqual(rows[0]['reason'], 'uncertain_probability')
+        # Cases are exported in priority order (highest priority first), then
+        # by descending neural probability:
+        #   case_0004 (rule_probability_conflict_high, 0.90),
+        #   case_0005 (rule_probability_conflict_low, 0.10),
+        #   case_0003 (uncertain_probability, 0.55),
+        #   case_0001 (uncertain_probability, 0.50),
+        #   case_0002 (uncertain_probability, 0.45).
+        self.assertEqual(rows[0]['case_id'], 'case_0004')
+        self.assertEqual(rows[0]['reason'], 'rule_probability_conflict_high')
+        self.assertEqual(rows[-1]['case_id'], 'case_0002')
+        self.assertEqual(rows[-1]['reason'], 'uncertain_probability')
 
         loaded = HITLQueue.load_json(json_path)
         self.assertEqual(len(loaded.cases), 5)
-        self.assertEqual(loaded.cases[-1].case_id, 'case_0005')
-        self.assertEqual(loaded.cases[0].sensor_values['s4'], EXAMPLES['critical']['s4'])
+        self.assertEqual(loaded.cases[0].case_id, 'case_0004')
+        self.assertEqual(loaded.cases[0].reason, 'rule_probability_conflict_high')
+        self.assertEqual(loaded.cases[-1].case_id, 'case_0002')
+        self.assertEqual(loaded.cases[-1].reason, 'uncertain_probability')
+        # The critical-example case is the low-priority conflict (case_0005).
+        self.assertEqual(
+            loaded.cases[1].sensor_values['s4'], EXAMPLES['critical']['s4']
+        )
 
     @unittest.skipUnless(PYSWIP_AVAILABLE, "SWI-Prolog/PySWIP not available")
     def test_feedback_updates_queue_log_and_learned_rules(self):
