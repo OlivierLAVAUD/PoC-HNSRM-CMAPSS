@@ -11,7 +11,6 @@ This PoC focuses on **tabular anomaly detection + symbolic reasoning + HITL** on
 
 The default architecture is RandomForest. LightGBM is a complementary path that receives interpretable temporal statistics in addition to the optional flattened window, and can use an out-of-fold RUL prediction as an extra feature. **CNN-LSTM** is a sequential architecture with Conv1D → LSTM → MultiHeadAttention that processes raw 3D sensor windows directly.
 
-GraphRAG, LLM and Neo4j are not present in either version.
 
 ## Pipeline
 
@@ -60,6 +59,16 @@ human label -> rules_learned.pl
 The neural model detects degradation from sliding windows. **RandomForest** remains the default architecture. **LightGBM** is a complementary path that receives interpretable temporal statistics in addition to the optional flattened window, and can use an out-of-fold RUL prediction as an extra feature. **CNN-LSTM** is a sequential architecture with Conv1D → LSTM → MultiHeadAttention that processes raw 3D sensor windows directly; probabilities are calibrated using validation-selected thresholds.
 
 Probabilities are calibrated on training data (sigmoid or isotonic), and the decision threshold is selected on validation data only. The symbolic layer explains which HPC conditions are active, including trend and persistence rules over the full window. ProbLog combines those conditions into a failure-risk estimate, optionally boosted by validated HITL rules. For LightGBM, a logistic model fitted on validation data only fuses the neural probability, symbolic score, ProbLog risk and predicted RUL. For CNN-LSTM, the validation-selected threshold is used directly.
+
+**Knowledge Graph (Optional)**
+
+An optional neuro-symbolic knowledge graph can be generated alongside the pipeline. When enabled via `knowledge_graph.enabled: true` in `configs/config.yaml`:
+
+- Maps 14 FD001 sensors to feature groups (temperature, pressure, vibration, flow, misc) using `SENSOR_GROUPS` definitions
+- Builds rule lists from `reasoner.learned_rules`
+- Renders `results/knowledge_graph.png` using `KnowledgeGraphGenerator` with `plot_type='focused_ieee'`
+- Uses `try/except ImportError` for graceful degradation if Graphviz is absent
+- Disabled by default; enable in `configs/config.yaml` to test end-to-end generation of `results/knowledge_graph.png`
 
 Alerts can require consecutive positive windows or a smoothed risk score. Cases where the neural probability and symbolic evidence disagree, or where the probability is close to the decision boundary, are placed in a human review queue.
 
@@ -486,7 +495,6 @@ Expected result: `177 tests ... OK`. The FD001 threshold, provenance and classif
 - The decision threshold implements a recall-oriented policy; changing the precision constraint changes the precision/recall trade-off.
 - HITL feedback can add symbolic and ProbLog rules, but it does not retrain the neural classifier.
 - Temporal thresholds are fitted on training windows; learned-rule validation uses validation data. Neither is tuned on the official test set.
-- No RL, control actions, LLM reasoning, GraphRAG or Neo4j.
 - Multi-seed validation only re-splits the 40 training engines: five seeds give 20 training and 20 validation engines each. It measures split sensitivity, not a different dataset.
 - The fusion diagnostics use engine-grouped cross-validation on the 20 validation engines, so fold estimates are coarse (four engines per held-out fold) and only detect large effects.
 - Drift on the official test engines is legitimately different from training: FD001 test trajectories run to failure while the training trajectories are truncated, so a non-`ok` drift level there is expected and is not a defect.

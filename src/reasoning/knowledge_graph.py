@@ -36,6 +36,20 @@ SENSOR_GROUPS: Dict[str, List[str]] = {
     "misc": ["s8", "s15", "s17", "s20"],
 }
 
+# Mapping from individual FD001 sensors to feature names.
+# These are *approximate proxies* — the original Knowledge Graph expected
+# 7 synthetic features (temperature, vibration, pressure, system_state,
+# efficiency_index, performance_score). The mapping below adapts the 14
+# FD001 sensors to feature names, but the proxies are not semantically
+# equivalent to the original features (e.g. s11 'vibration' maps from an
+# HPC static pressure reading, not a mechanical vibration).
+sensor_mapping: Dict[str, str] = {
+    's4': 'temperature',      # T50, LPT outlet temp
+    's11': 'vibration',       # Ps30, HPC static pressure (proxy)
+    's7': 'pressure',         # P30, HPC outlet pressure (proxy)
+    's12': 'efficiency_index' # phi, fuel flow (proxy)
+}
+
 
 class KnowledgeGraphGenerator:
     """Build and render a small neuro-symbolic knowledge graph.

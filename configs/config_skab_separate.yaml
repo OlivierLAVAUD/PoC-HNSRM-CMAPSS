@@ -1,0 +1,45 @@
+# SKAB Separate Configuration
+# This config is separate from config_skab.yaml to avoid fragile 8→7 feature mapping
+
+benchmark: skab
+
+# Dataset configuration
+data_path: data/SKAB
+
+# Feature configuration (SKAB has 8 features, different from FD001's 7)
+features:
+  - air_temperature
+  - process_temperature
+  - rotational_speed
+  - torque
+  - tool_wear
+  - vibration_x
+  - vibration_y
+  - vibration_z
+
+# Model configuration
+model:
+  type: random_forest
+  n_estimators: 100
+  max_depth: 10
+  random_state: 42
+
+# Symbolic reasoning configuration
+symbolic:
+  min_support: 3
+  max_rules: 50
+  min_confidence: 0.7
+  max_false_positive_rate: 0.05
+
+# Paths
+paths:
+  results_dir: results/skab_separate
+  rules_file: rules_learned.pl
+
+# Mode configuration
+modes:
+  - random_forest
+  - symbolic
+
+# Logging
+log_level: INFO

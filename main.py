@@ -199,6 +199,12 @@ if __name__ == '__main__':
                         help='Sweep validation-selected decision thresholds.')
     parser.add_argument('--operational-policy', action='store_true',
                         help='Select the alert mode from maintenance costs.')
+    parser.add_argument(
+        "--benchmark",
+        choices=["fd001", "skab"],
+        default="fd001",
+        help="Benchmark dataset to use (fd001 or skab)."
+    )
     args = parser.parse_args()
     sys.exit(main(
         clear=args.clear_results,

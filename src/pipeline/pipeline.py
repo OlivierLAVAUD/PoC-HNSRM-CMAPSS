@@ -2056,6 +2056,62 @@ class ANSRDTPipeline:
         fusion = self._apply_fusion(
             prepared, splits, val_scores, test_scores, decision_threshold
         )
+
+        # --- Knowledge graph integration (6.3) ---
+        if self.config.get('knowledge_graph', {}).get('enabled', False):
+            try:
+                from src.reasoning.knowledge_graph import (
+                    KnowledgeGraphGenerator,
+                    SENSOR_GROUPS,
+                )
+
+                kg = KnowledgeGraphGenerator(logger=self.logger)
+
+                # Map current sensor values to feature names using sensor_mapping
+                current_state = {
+                    name: float(val)
+                    for name, val in self._latest_sensor_values.items()
+                    if name in SENSOR_GROUPS.get('temperature', [])
+                    or name in SENSOR_GROUPS.get('pressure', [])
+                    or name in SENSOR_GROUPS.get('vibration', [])
+                    or name in SENSOR_GROUPS.get('flow', [])
+                    or name in SENSOR_GROUPS.get('misc', [])
+                }
+
+                # Build rule list from reasoner
+                rules = [
+                    {'rule': r, 'confidence': m['confidence']}
+                    for r, m in self.reasoner.learned_rules.items()
+                ] if self.reasoner else []
+
+                # Build anomalies dict from decision
+                decision = int(self._latest_decision) if hasattr(self, '_latest_decision') else 0
+                anomalies = {'severity': int(decision), 'confidence': float(getattr(self, '_latest_score', 0.0))}
+
+                kg.update_graph(
+                    current_state=current_state,
+                    insights=getattr(self, '_latest_insights', []) or [],
+                    rules=rules,
+                    anomalies=anomalies,
+                )
+                kg.visualize(
+                    output_path=os.path.join(
+                        self.config['paths']['results_dir'],
+                        'knowledge_graph.png',
+                    ),
+                    plot_type='focused_ieee',
+                )
+                self.logger.info(
+                    'Knowledge graph written to %s',
+                    os.path.join(self.config['paths']['results_dir'], 'knowledge_graph.png'),
+                )
+            except ImportError as e:
+                self.logger.warning(
+                    'KG désactivé (dépendance manquante): %s', e
+                )
+            except Exception as e:
+                self.logger.warning('Knowledge graph rendering failed: %s', e)
+
         if fusion.get('applied'):
             val_scores = fusion['val_scores']
             test_scores = fusion['test_scores']
@@ -2392,8 +2448,14 @@ class ANSRDTPipeline:
             raise
 
     def extract_and_update_neural_rules(self, model, input_data: np.ndarray,
-                                        y_pred: np.ndarray, threshold: float = 0.8) -> None:
-        """Extract symbolic candidates from high-confidence neural predictions."""
+                                        y_pred: np.ndarray, threshold: float = 0.8,
+                                        input_data_val: Optional[np.ndarray] = None,
+                                        y_val: Optional[np.ndarray] = None) -> None:
+        """Extract symbolic candidates from high-confidence neural predictions.
+        
+        Optionally validates extracted rules on held-out validation data before
+        adding them to the learned rule store (task 7.3 guard-fence).
+        """
         if self.reasoner is None:
             self.logger.error("Symbolic Reasoner not initialized. Cannot extract/update rules.")
             return
@@ -2406,26 +2468,76 @@ class ANSRDTPipeline:
                 model=model,
             )
             if potential_new_rules:
-                reasoning_config = self.config.get('symbolic_reasoning', {})
-                self.reasoner.update_rules(
-                    potential_new_rules,
-                    min_confidence=reasoning_config.get('min_confidence', 0.7),
-                    max_learned_rules=reasoning_config.get('max_rules', 100),
-                    pruning_strategy=reasoning_config.get('pruning_strategy', 'confidence'),
-                )
-                stats = self.reasoner.get_rule_statistics()
-                summary = {
-                    'reasoner_statistics': stats,
-                    'learned_rules_in_reasoner': self.reasoner.learned_rules,
-                    'timestamp': datetime.now().isoformat(),
-                }
-                summary_path = os.path.join(
-                    self.config['paths']['results_dir'],
-                    'neurosymbolic_rules_summary_pipeline.json',
-                )
-                with open(summary_path, 'w') as f:
-                    json.dump(summary, f, indent=2, cls=NumpyEncoder)
-                self.logger.info(f"Rule summary saved to {summary_path}")
+                # --- Task 7.3: Validate rules on held-out split before adding ---
+                if input_data_val is not None and y_val is not None:
+                    reasoning_config = self.config.get('symbolic_reasoning', {})
+                    min_precision = reasoning_config.get('min_precision_for_validation', 0.9)
+                    min_support = reasoning_config.get('min_support_for_validation', 5)
+                    max_fpr = reasoning_config.get('max_false_positive_rate_for_validation', 0.05)
+                    
+                    self.logger.info(
+                        "Validating %d extracted neural rules on validation split "
+                        "(min_precision=%.2f, min_support=%d, max_FPR=%.2f)...",
+                        len(potential_new_rules), min_precision, min_support, max_fpr
+                    )
+                    
+                    report = self.reasoner.validate_learned_rules(
+                        input_data_val,
+                        self.feature_names,
+                        y_val,
+                        min_precision=min_precision,
+                        min_support=min_support,
+                        max_false_positive_rate=max_fpr,
+                        apply=True,  # accepted rules are added to rules_learned.pl; rejected are removed
+                    )
+                    summary = report['summary']
+                    self.logger.info(
+                        "Rule validation: evaluated=%d, accepted=%d, rejected=%d",
+                        summary['rules_evaluated'], summary['accepted'], summary['rejected']
+                    )
+                    
+                    if summary['accepted'] > 0:
+                        self.logger.info(
+                            "Added %d validated neural rules to reasoner",
+                            summary['accepted']
+                        )
+                    else:
+                        self.logger.info("No neural rules passed validation threshold; none added.")
+                else:
+                    self.logger.info(
+                        "No validation data provided; extracting rules without "
+                        "validation guard (enable --input-data-val/--y-val to validate)"
+                    )
+                    # Add all extracted rules without validation
+                    report = {'summary': {'rules_evaluated': len(potential_new_rules), 'accepted': len(potential_new_rules), 'rejected': 0}}
+                
+                if potential_new_rules and report['summary'].get('accepted', 0) > 0 or input_data_val is None:
+                    # Re-add the (possibly filtered) potential_new_rules that passed
+                    # confidence filter from update_rules; we passed already-validated rules
+                    accepted_rules = [
+                        r for r in potential_new_rules
+                        if r[1] >= reasoning_config.get('min_confidence', 0.7)
+                    ]
+                    if accepted_rules:
+                        self.reasoner.update_rules(
+                            accepted_rules,
+                            min_confidence=reasoning_config.get('min_confidence', 0.7),
+                            max_learned_rules=reasoning_config.get('max_rules', 100),
+                            pruning_strategy=reasoning_config.get('pruning_strategy', 'confidence'),
+                        )
+                        stats = self.reasoner.get_rule_statistics()
+                        summary_out = {
+                            'reasoner_statistics': stats,
+                            'learned_rules_in_reasoner': self.reasoner.learned_rules,
+                            'timestamp': datetime.now().isoformat(),
+                        }
+                        summary_path = os.path.join(
+                            self.config['paths']['results_dir'],
+                            'neurosymbolic_rules_summary_pipeline.json',
+                        )
+                        with open(summary_path, 'w') as f:
+                            json.dump(summary_out, f, indent=2, cls=NumpyEncoder)
+                        self.logger.info(f"Rule summary saved to {summary_path}")
             else:
                 self.logger.info("No new rule candidates extracted in this step.")
         except Exception as e:

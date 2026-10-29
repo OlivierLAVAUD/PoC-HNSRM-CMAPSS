@@ -89,6 +89,14 @@ gradient_threshold(s20, 0.280).
 gradient_threshold(s21, 0.166).
 
 % ---------------------------------------------------------------------------
+% Feature name aliases: map FD001 sensor numbers to human-readable feature names
+% These allow neural rule extraction to use descriptive names (temperature,
+% vibration, pressure, efficiency_index) instead of raw sensor numbers (s4, s11, s7, s12).
+% ---------------------------------------------------------------------------
+temperature_alias(s4).   % T50, LPT outlet temperature
+vibration_alias(s11).    % Ps30, HPC static pressure (proxy)
+pressure_alias(s7).      % P30, HPC outlet pressure (proxy)
+efficiency_alias(s12).   % phi, fuel flow (proxy)
 % Generic predicates used by neural rule extraction
 % ---------------------------------------------------------------------------
 feature_threshold(Sensor, Value, high) :-
