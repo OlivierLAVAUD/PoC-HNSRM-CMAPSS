@@ -1,21 +1,17 @@
-# ANSR-DT: Lightweight HNSRM PoC on C-MAPSS FD001
+# ANSR-DT: HNSRM PoC on C-MAPSS FD001
 
-This repository is a lightweight **hybrid neuro-symbolic reasoning and monitoring (HNSRM)** proof of concept built on NASA C-MAPSS **FD001**. It keeps the core idea of ANSR-DT, neural perception followed by explicit symbolic and probabilistic reasoning, while removing the heavy components from the original framework.
+This repository is a **hybrid neuro-symbolic reasoning and monitoring (HNSRM)** proof of concept built on NASA C-MAPSS **FD001**. It keeps the core idea of ANSR-DT, neural perception followed by explicit symbolic and probabilistic reasoning, while removing the heavy components from the original framework.
 
-## Périmètre
+## Scope
 
-Ce PoC se concentre sur la **détection d'anomalie tabulaire + raisonnement
-symbolique + HITL** sur FD001. Par rapport à ANSR-DT original :
+This PoC focuses on **tabular anomaly detection + symbolic reasoning + HITL** on FD001. Compared to the original ANSR-DT framework:
 
-- **Retiré** : CNN-LSTM (remplacé par RF/LightGBM + features temporelles
-  explicites), PPO/contrôle (FD001 n'a pas de boucle de contrôle),
-  Knowledge Graph, path SKAB natif.
-- **Ajouté** : calibration, seuil de décision validation-only, fusion
-  logistique, provenance symbolique bloquante, validation des règles HITL,
-  audit trail, dérive (drift), multi-seed, sensibilité au seuil, politique
-  opérationnelle.
+- **Removed**: PPO/control (FD001 has no control loop), native SKAB path.
+- **Added**: calibration, decision threshold validation-only, logistic fusion, symbolic provenance blocking, HITL rule validation, audit trail, drift, multi-seed, threshold sensitivity, operational policy, and **CNN-LSTM** neural architecture.
 
-GraphRAG, LLM et Neo4j ne sont présents dans aucune des deux versions.
+The default architecture is RandomForest. LightGBM is a complementary path that receives interpretable temporal statistics in addition to the optional flattened window, and can use an out-of-fold RUL prediction as an extra feature. **CNN-LSTM** is a sequential architecture with Conv1D → LSTM → MultiHeadAttention that processes raw 3D sensor windows directly.
+
+GraphRAG, LLM and Neo4j are not present in either version.
 
 ## Pipeline
 
@@ -31,30 +27,41 @@ StandardScaler + flatten     explicit temporal features
                              + auxiliary RUL regressor
         |                           |
         +--> calibration on training data (auto: sigmoid/isotonic)
-        |                           |
-        +--> validation-only decision threshold
-        |                           |
-        |                           +--> validation-only logistic fusion
-        |                                (neural, symbolic, ProbLog, RUL)
-        |                           |
-        +--> full window -> SWI-Prolog HPC + temporal rules -> insights
-                                    |
-                       active conditions + learned HITL rules
-                                    |
-                                    v
-                        ProbLog model -> P(failure_risk)
-                                    |
-                                    v
-                        alert confirmation (k consecutive / smoothing)
-                                    |
-                                    v
-                        HITL queue (uncertain / conflicting)
-                                    |
-                       human label -> rules_learned.pl
-                                    -> hitl_log.jsonl
+        |
+        v
+validation-only decision threshold
+        |
+        v
+validation-only logistic fusion
+        (neural, symbolic, ProbLog, RUL)
+        |
+        v
+full window -> SWI-Prolog HPC + temporal rules -> insights
+        |
+        v
+active conditions + learned HITL rules
+        |
+        v
+ProbLog model -> P(failure_risk)
+        |
+        v
+alert confirmation (k consecutive / smoothing)
+        |
+        v
+HITL queue (uncertain / conflicting)
+        |
+        v
+human label -> rules_learned.pl
+        -> hitl_log.jsonl
+
+**CNN-LSTM** processes raw 3D windows (no flattening, no StandardScaler). Calibration is skipped for sequential architectures; the validation-selected decision threshold is used directly. Probabilities flow through `positive_proba()` which handles 3D input natively.
 ```
 
-The neural model detects degradation from sliding windows. RandomForest remains the default architecture. LightGBM is a complementary path that receives interpretable temporal statistics in addition to the optional flattened window, and can use an out-of-fold RUL prediction as an extra feature. Probabilities are calibrated on training data, and the decision threshold is selected on validation data only. The symbolic layer explains which HPC conditions are active, including trend and persistence rules over the full window. ProbLog combines those conditions into a failure-risk estimate, optionally boosted by validated HITL rules. For LightGBM, a logistic model fitted on validation data only fuses the neural probability, symbolic score, ProbLog risk and predicted RUL. Alerts can require consecutive positive windows or a smoothed risk score. Cases where the neural probability and symbolic evidence disagree, or where the probability is close to the decision boundary, are placed in a human review queue.
+The neural model detects degradation from sliding windows. **RandomForest** remains the default architecture. **LightGBM** is a complementary path that receives interpretable temporal statistics in addition to the optional flattened window, and can use an out-of-fold RUL prediction as an extra feature. **CNN-LSTM** is a sequential architecture with Conv1D → LSTM → MultiHeadAttention that processes raw 3D sensor windows directly; probabilities are calibrated using validation-selected thresholds.
+
+Probabilities are calibrated on training data (sigmoid or isotonic), and the decision threshold is selected on validation data only. The symbolic layer explains which HPC conditions are active, including trend and persistence rules over the full window. ProbLog combines those conditions into a failure-risk estimate, optionally boosted by validated HITL rules. For LightGBM, a logistic model fitted on validation data only fuses the neural probability, symbolic score, ProbLog risk and predicted RUL. For CNN-LSTM, the validation-selected threshold is used directly.
+
+Alerts can require consecutive positive windows or a smoothed risk score. Cases where the neural probability and symbolic evidence disagree, or where the probability is close to the decision boundary, are placed in a human review queue.
 
 ## Reliability and evaluation safeguards
 
@@ -491,7 +498,7 @@ Expected result: `177 tests ... OK`. The FD001 threshold, provenance and classif
 
 ## Original ANSR-DT publications
 
-This repository is a lightweight derivative for FD001 experimentation. The original framework is described in:
+This repository is a derivative for FD001 experimentation. The original framework is described in:
 
 ```bibtex
 @article{hakim2025ansr,
