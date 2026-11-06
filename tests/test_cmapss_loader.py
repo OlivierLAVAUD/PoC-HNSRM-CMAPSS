@@ -4,7 +4,6 @@ import os
 import tempfile
 import unittest
 
-import numpy as np
 import pandas as pd
 
 from src.data.cmapss_loader import CMAPSSLoader, RAW_COLUMNS, USEFUL_SENSORS

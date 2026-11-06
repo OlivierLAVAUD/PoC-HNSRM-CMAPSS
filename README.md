@@ -6,10 +6,10 @@ This repository is a **hybrid neuro-symbolic reasoning and monitoring (HNSRM)** 
 
 This PoC focuses on **tabular anomaly detection + symbolic reasoning + HITL** on FD001. Compared to the original ANSR-DT framework:
 
-- **Removed**: PPO/control (FD001 has no control loop), native SKAB path.
-- **Added**: calibration, decision threshold validation-only, logistic fusion, symbolic provenance blocking, HITL rule validation, audit trail, drift, multi-seed, threshold sensitivity, operational policy, and **CNN-LSTM** neural architecture.
+- **Removed**: PPO/control (FD001 has no control loop).
+- **Added**: calibration, decision threshold validation-only, logistic fusion, symbolic provenance blocking, HITL rule validation, audit trail, drift, multi-seed, threshold sensitivity, operational policy, episode-level metrics, alert hysteresis, nested fusion validation, optional RUL uncertainty, the standalone SKAB benchmark, and **CNN-LSTM** neural architecture.
 
-The default architecture is RandomForest. LightGBM is a complementary path that receives interpretable temporal statistics in addition to the optional flattened window, and can use an out-of-fold RUL prediction as an extra feature. **CNN-LSTM** is a sequential architecture with Conv1D → LSTM → MultiHeadAttention that processes raw 3D sensor windows directly.
+The default architecture is RandomForest. LightGBM is a complementary path that receives interpretable temporal statistics in addition to the optional flattened window, and can use an out-of-fold RUL prediction as an extra feature. The same entry point also runs the SKAB benchmark with `--benchmark skab`. **CNN-LSTM** is a sequential architecture with Conv1D → LSTM → MultiHeadAttention that processes raw 3D sensor windows directly.
 
 
 ## Pipeline
@@ -79,7 +79,8 @@ Alerts can require consecutive positive windows or a smoothed risk score. Cases 
 - **Explicit temporal features:** the LightGBM path builds 13 interpretable statistics per sensor (first/last value, mean, standard deviation, min/max, slope, relative change, moving-average statistics and trailing persistence). Percentile thresholds are fitted on training windows only, and the optional flattened raw window is appended in sensor-major then cycle order (`results/temporal_feature_metadata.json`).
 - **Auxiliary RUL regression:** a LightGBM regressor is trained on the training split. Its out-of-fold predictions are generated with unit-grouped `GroupKFold`, so windows from the same engine never appear on both sides of a fold. Predicted RUL is appended to the classifier features and is also a fusion input.
 - **Validation-only fusion:** `ProbabilityFusion` standardises `[neural_probability, symbolic_rule_score, problog_failure_risk, predicted_rul]` and fits logistic regression on the validation split only. The fusion threshold is selected on validation as well; coefficients are recorded for auditability in `results/cmapss_results.json`.
-- **Alert confirmation:** `results/alerting_analysis*.json` compares immediate alerts with `k` consecutive positive windows and trailing moving-average smoothing, including false alarms, recall, precision and lead-time deltas.
+- **Alert confirmation:** `results/alerting_analysis*.json` compares immediate alerts with `k` consecutive positive windows, trailing moving-average smoothing and optional hysteresis, including false alarms, recall, precision and lead-time deltas. Hysteresis derives `enter = threshold + margin` and `exit = threshold - margin` on validation, clipped to `[0, 1]`.
+- **Episode-level metrics:** `results/episode_metrics_validation.csv` and `results/episode_metrics_test.csv` group consecutive positive windows into real degradation episodes and alert episodes per engine, then report episode recall/precision, false-alarm episodes, first correct alert, time to episode end and anticipation. These are reporting metrics computed after the final decision is fixed.
 - **Model comparison:** `python main.py --compare-models` evaluates RandomForest and LightGBM on the same engine-level split. The selected model is chosen from validation metrics only; the comparison report records `selection_split: "validation"`.
 - **Engine-level metrics:** per-engine recall, precision, false alarms, first alert cycle, lead time and anticipation are exported to `results/engine_metrics_validation.csv` and `results/engine_metrics_test.csv`, plus fusion and per-architecture copies.
 - **Temporal rules:** slopes, relative changes, moving averages, standard deviation and persistence are computed per window. Their thresholds come from training windows only (`results/temporal_thresholds.json`). They are computed before fusion so training and inference use the same symbolic contract.
@@ -89,7 +90,8 @@ Alerts can require consecutive positive windows or a smoothed risk score. Cases 
 - **Multi-seed validation:** `python main.py --multi-seed --seeds 42,43,44,45,46` re-splits the training engines per seed, re-derives the symbolic thresholds from that seed's own training engines, retrains, recalibrates, re-selects the neural and fusion thresholds on validation, refits the fusion and evaluates on the unchanged official test engines. It writes `results/multi_seed_report.json`, `results/multi_seed_summary.csv` and `results/visualization/multi_seed_distributions.png`; per-seed artifacts stay under `results/multi_seed/seed_<seed>/`.
 - **Threshold sensitivity:** `python main.py --threshold-sensitivity` sweeps `recall_at_precision` precision constraints, F-beta weights and F1, still selecting every threshold on validation only. Outputs `results/threshold_sensitivity.json`, `.csv` and `results/visualization/threshold_sensitivity.png`.
 - **Operational alert policy:** `python main.py --operational-policy` prices false negatives and false alarms (`operational_policy.false_negative_cost`, `false_alarm_cost`), compares immediate, consecutive and smoothed alerts, and selects a mode on validation. The decision and its rationale are written to `results/operational_policy.json`.
-- **Fusion robustness:** `fusion.validation` runs an engine-grouped cross-validation over the validation engines and an ablation study, reporting coefficient and threshold stability, relative input importance and the validation delta of removing each input (`results/fusion_diagnostics.json`, `results/fusion_ablation.json`). This is diagnostics only: the production fusion remains a single validation-fitted logistic model.
+- **Fusion robustness:** `fusion.validation` runs an engine-grouped cross-validation over the validation engines and an ablation study, reporting coefficient and threshold stability, relative input importance and the validation delta of removing each input (`results/fusion_diagnostics.json`, `results/fusion_ablation.json`). `fusion.nested_validation` optionally adds an engine-grouped nested validation of the full fusion recipe and writes `results/fusion_nested_validation.json`; both are diagnostics only, and the production fusion remains a single validation-fitted logistic model.
+- **RUL uncertainty:** `rul_regression.uncertainty` optionally replaces the single RUL regressor with a small LightGBM ensemble. The median is used as `predicted_rul`; the member standard deviation can join the validation-fitted fusion as `rul_uncertainty`. Disabled by default, so metrics are unchanged unless explicitly enabled.
 - **Drift detection:** `monitoring.drift` compares incoming windows with training percentiles, bounds, NaN/Inf share and the predicted signal distributions, then reports `ok`, `warning` or `critical` in `results/drift_report.json`. A critical level never blocks inference: it warns and recommends routing the windows to the HITL queue.
 - **Decision audit:** every decided window gets a `decision_id`, artifact versions and SHA-256 digests (model, scaler, temporal metadata, `rules.pl`, `rules_learned.pl`, `prob_rules.pl`), both thresholds, the four fusion signals, the final decision and the data-quality context. The journal is `results/decision_audit.jsonl`; `python -m src.utils.audit --results results` verifies it.
 
@@ -138,6 +140,7 @@ Requirements:
 - Python 3.10+ (tested with Python 3.13)
 - SWI-Prolog (tested with 10.0.2)
 - `pip install -r requirements.txt`
+- `pip install -r requirements-dev.txt` for lint/tests, or `pip install -r requirements-cnn.txt` for the optional TensorFlow path
 
 On Windows, make SWI-Prolog available before running any test or pipeline command:
 
@@ -188,9 +191,16 @@ python main.py --operational-policy
 
 # Verify the audit trail of the last run
 python -m src.utils.audit --results results
+
+# Run the standalone SKAB benchmark (same options are available on main.py)
+python main.py --benchmark skab --modes random_forest symbolic
+
+# Reproducible developer shortcuts
+make lint
+make test
 ```
 
-The new analyses are also configurable: `experiments.multi_seed`, `threshold_sensitivity` and `operational_policy` are disabled by default and enabled by their flag (or with `enabled: true`), while `monitoring.drift`, `audit` and `fusion.validation` are enabled in `configs/config.yaml` and run with every normal pipeline run.
+The new analyses are also configurable: `experiments.multi_seed`, `threshold_sensitivity`, `operational_policy`, `fusion.nested_validation` and `rul_regression.uncertainty` are disabled by default and enabled by their flag (or with `enabled: true`), while `alerting.hysteresis`, `monitoring.drift`, `audit` and `fusion.validation` are enabled in `configs/config.yaml` and run with every normal pipeline run.
 
 The pipeline writes the run summary, metrics, calibration/threshold reports, alerting analysis, HITL queue and architecture-specific artifacts. Key files:
 
@@ -201,6 +211,8 @@ The pipeline writes the run summary, metrics, calibration/threshold reports, ale
 - `results/alerting_analysis.json` and `results/alerting_analysis_fusion.json`
 - `results/temporal_feature_metadata.json`
 - `results/engine_metrics_validation.csv` and `results/engine_metrics_test.csv`
+- `results/episode_metrics_validation.csv` and `results/episode_metrics_test.csv`
+- `results/fusion_nested_validation.json` (when `fusion.nested_validation.enabled` is true)
 - `results/temporal_thresholds.json`
 - `results/hitl_rule_validation.json`
 - `results/hitl_queue.csv`, `results/hitl_queue.json` and `results/hitl_log.jsonl` (after feedback)
@@ -247,6 +259,8 @@ Run the test suite (with SWI-Prolog on `PATH`):
 
 ```bash
 python -m unittest discover -s tests -q
+# or
+make test
 ```
 
 ## Current results
@@ -416,7 +430,8 @@ src/
     calibration.py                # Brier score, ECE, reliability curves
     thresholding.py               # validation-only threshold selection
     engine_metrics.py             # per-engine recall, false alarms, lead time
-    alerting.py                   # consecutive confirmation and smoothing
+    episode_metrics.py            # degradation/alert episodes per engine
+    alerting.py                   # confirmation, smoothing, hysteresis
     operational_policy.py         # alert modes priced by maintenance cost
   experiments/
     multi_seed.py                 # per-seed protocol, aggregates, CSV, plot
@@ -426,6 +441,7 @@ src/
   fusion/
     probability_fusion.py         # validation-only logistic fusion
     diagnostics.py                # grouped CV, stability, ablation
+    nested_validation.py          # engine-grouped nested validation report
   hitl/
     queue.py                      # uncertain/conflict queue, CSV/JSON export
     feedback.py                   # labels, learned rules, JSONL log, CLI
@@ -433,11 +449,13 @@ src/
     inference.py                  # legacy/raw C-MAPSS inference, optional fusion
   models/
     light_classifier.py           # RandomForest / MLP / LightGBM + calibration
-    rul_regressor.py              # auxiliary LightGBM RUL and grouped OOF
+    rul_regressor.py              # LightGBM RUL, optional uncertainty ensemble
   monitoring/
     drift.py                      # training reference vs incoming windows
   pipeline/
     pipeline.py                   # training, comparison, fusion, alerting, HITL
+  skab/
+    run.py                        # standalone SKAB CLI, reused by main.py
   reasoning/
     rules.pl                      # HPC symbolic rules, thresholds and temporal rules
     prob_rules.pl                 # ProbLog failure-risk model
@@ -453,7 +471,7 @@ legacy/
   synthetic_data_loader.py        # .npz synthetic loader (not FD001)
   adaptive_controller.py          # synthetic-only control loop (not FD001)
   data/                           # synthetic .npz sample used by the legacy path
-tests/                            # 177 unit and integration tests
+tests/                            # 198 unit and integration tests
 results/                          # generated artifacts (ignored by git)
 ```
 
@@ -475,14 +493,14 @@ remaining link and is exercised by `tests/test_data_loader.py`.
 
 ## Testing
 
-The suite covers the C-MAPSS loader, RandomForest/LightGBM classifiers, calibration, thresholding, engine metrics, temporal features, RUL regression, alert confirmation, probability fusion, config validation, learned-rule validation, symbolic-threshold provenance, the published README metrics, ProbLog, the pipeline, inference, the HITL queue and HITL feedback. The new analyses have their own tests: `test_multi_seed.py`, `test_threshold_sensitivity.py`, `test_operational_policy.py`, `test_fusion_diagnostics.py`, `test_drift.py`, `test_audit.py` and `test_pipeline_analyses.py`.
+The suite covers the C-MAPSS loader, RandomForest/LightGBM classifiers, calibration, thresholding, engine metrics, episode metrics, temporal features, RUL regression and uncertainty, alert confirmation and hysteresis, probability fusion, nested fusion validation, config validation, learned-rule validation, symbolic-threshold provenance, the published README metrics, ProbLog, the pipeline, inference, the HITL queue and HITL feedback. The analyses have their own tests: `test_multi_seed.py`, `test_threshold_sensitivity.py`, `test_operational_policy.py`, `test_fusion_diagnostics.py`, `test_nested_validation.py`, `test_drift.py`, `test_audit.py`, `test_skab_cli.py` and `test_pipeline_analyses.py`.
 
 ```bash
 $env:Path = "C:\Program Files\swipl\bin;$env:Path"
 python -m unittest discover -s tests -q
 ```
 
-Expected result: `177 tests ... OK`. The FD001 threshold, provenance and classifier tests, plus the README metric check, are skipped when the parquet or run artifacts are missing; the symbolic tests are skipped when SWI-Prolog is not available.
+Expected result: `198 tests ... OK` (18 skipped without SWI-Prolog). The FD001 threshold, provenance and classifier tests, plus the README metric check, are skipped when the parquet or run artifacts are missing; the symbolic tests are skipped when SWI-Prolog is not available.
 
 ## Limitations
 

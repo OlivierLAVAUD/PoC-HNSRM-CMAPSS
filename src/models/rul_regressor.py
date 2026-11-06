@@ -4,7 +4,7 @@ from __future__ import annotations
 
 import logging
 import os
-from typing import Any, Dict, Optional
+from typing import Dict, Optional
 
 import joblib
 import numpy as np
@@ -105,6 +105,91 @@ class RULLightGBMRegressor:
         instance = joblib.load(path)
         if not isinstance(instance, cls):
             raise TypeError(f"Object at {path} is not a RULLightGBMRegressor")
+        if logger is not None:
+            instance.logger = logger
+        return instance
+
+
+
+class RULEnsembleRegressor:
+    """Small LightGBM ensemble exposing a median RUL and its dispersion."""
+
+    def __init__(self, n_models: int = 5, random_state: int = 42,
+                 logger: Optional[logging.Logger] = None, **kwargs):
+        self.n_models = max(1, int(n_models))
+        self.random_state = int(random_state)
+        self.logger = logger or logging.getLogger(__name__)
+        self.kwargs = dict(kwargs)
+        self.members = [
+            RULLightGBMRegressor(
+                random_state=self.random_state + index,
+                logger=self.logger,
+                **self.kwargs,
+            )
+            for index in range(self.n_models)
+        ]
+        self.feature_names: Optional[list] = None
+
+    @staticmethod
+    def _sanitize(X: np.ndarray) -> np.ndarray:
+        """Keep missing values as NaN and reject infinities."""
+        values = np.asarray(X, dtype=np.float32)
+        return np.where(np.isfinite(values), values, np.nan).astype(np.float32)
+
+    def fit(self, X: np.ndarray, y: np.ndarray) -> "RULEnsembleRegressor":
+        """Fit every member on the same training data with its own seed."""
+        values = self._sanitize(X)
+        for member in self.members:
+            member.fit(values, y)
+        self.logger.info(
+            "RUL ensemble fitted with %d members.", len(self.members)
+        )
+        return self
+
+    def predict_distribution(self, X: np.ndarray) -> Dict[str, np.ndarray]:
+        """Return median, standard deviation and a [q10, q90] interval."""
+        values = self._sanitize(X)
+        predictions = np.vstack([
+            member.predict(values) for member in self.members
+        ])
+        median = np.median(predictions, axis=0)
+        std = np.std(predictions, axis=0, ddof=0)
+        lower = np.quantile(predictions, 0.10, axis=0)
+        upper = np.quantile(predictions, 0.90, axis=0)
+        return {
+            'median': np.asarray(median, dtype=float).ravel(),
+            'std': np.asarray(std, dtype=float).ravel(),
+            'q10': np.asarray(lower, dtype=float).ravel(),
+            'q90': np.asarray(upper, dtype=float).ravel(),
+        }
+
+    def predict(self, X: np.ndarray) -> np.ndarray:
+        """Return the median ensemble RUL prediction."""
+        return self.predict_distribution(X)['median']
+
+    @staticmethod
+    def metrics(y_true: np.ndarray, y_pred: np.ndarray) -> Dict[str, float]:
+        """Return the same metrics as the single RUL regressor."""
+        return RULLightGBMRegressor.metrics(y_true, y_pred)
+
+    def save(self, path: str) -> str:
+        """Persist the fitted ensemble with joblib."""
+        directory = os.path.dirname(path)
+        if directory:
+            os.makedirs(directory, exist_ok=True)
+        joblib.dump(self, path)
+        return path
+
+    @classmethod
+    def load(cls, path: str,
+             logger: Optional[logging.Logger] = None
+             ) -> "RULEnsembleRegressor":
+        """Load a persisted ensemble."""
+        if not os.path.exists(path):
+            raise FileNotFoundError(f"RUL ensemble not found at {path}")
+        instance = joblib.load(path)
+        if not isinstance(instance, cls):
+            raise TypeError(f"Object at {path} is not a RULEnsembleRegressor")
         if logger is not None:
             instance.logger = logger
         return instance

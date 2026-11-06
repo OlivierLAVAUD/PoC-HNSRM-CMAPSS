@@ -5,8 +5,11 @@ Provides rule validation, deduplication, and confidence analysis.
 """
 
 import logging
-from typing import List, Tuple, Dict, Optional
+import os
 from datetime import datetime
+from typing import List, Tuple
+
+import numpy as np
 
 logger = logging.getLogger(__name__)
 
@@ -43,21 +46,15 @@ def validate_skab_rules(
     accepted = 0
     rejected = 0
     
-    # Simple validation: count rules that reference features present in data
-    valid_rule_count = 0
-    
+    # Simple heuristic: a rule is accepted when it is non-trivial and cites
+    # at least one known feature.
+    known_features = [str(name).lower() for name in feature_names]
     for rule_str in rules:
         evaluated += 1
-        # Check if rule references valid features
-        valid = True
-        for feat in feature_names:
-            if f"{feat}" in rule_str.lower():
-                # Feature referenced - check if rule has reasonable structure
-                pass
-        
-        # Basic heuristic: rule is "accepted" if it has reasonable length
-        # and references known features
-        if len(rule_str) > 10 and evaluated <= len(rules):
+        references_known_feature = any(
+            name in rule_str.lower() for name in known_features
+        )
+        if len(rule_str) > 10 and references_known_feature:
             accepted += 1
         else:
             rejected += 1

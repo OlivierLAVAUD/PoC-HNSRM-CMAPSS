@@ -6,7 +6,7 @@ benchmark: skab
 # Dataset configuration
 data_path: data/SKAB
 
-# Feature configuration (SKAB has 8 features, different from FD001's 7)
+# Feature configuration (SKAB has 8 features, different from FD001's 14)
 features:
   - air_temperature
   - process_temperature

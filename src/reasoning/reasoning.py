@@ -37,6 +37,15 @@ def _extract_rule_body(rule_string: str) -> Optional[str]:
     return body
 
 
+def _body_to_key(rule_string: str) -> str:
+    """Return a stable deduplication key for a Prolog rule.
+
+    Rules sharing the same body but carrying different head names are
+    considered semantically identical.
+    """
+    return _extract_rule_body(rule_string) or rule_string.strip()
+
+
 class SymbolicReasoner:
     def __init__(
             self,
@@ -106,7 +115,7 @@ class SymbolicReasoner:
             if file == os.path.basename(self.learned_rules_path) and not os.path.exists(path):
                 try:
                     with open(path, 'w') as f:
-                        f.write(f"% Dynamically learned rules for ANSR-DT - Automatically managed\n")
+                        f.write("% Dynamically learned rules for ANSR-DT - Automatically managed\n")
                         f.write(":- discontiguous(neural_rule/0).\n")
                         f.write(":- discontiguous(gradient_rule/0).\n")
                         f.write(":- discontiguous(pattern_rule/0).\n")
@@ -119,7 +128,7 @@ class SymbolicReasoner:
                 try:
                     prolog_path = path.replace("\\", "/")
                     query = f"consult('{prolog_path}')"
-                    result = list(self.prolog.query(query))
+                    list(self.prolog.query(query))
                     self.logger.info(f"Consulted Prolog file: {path}")
                 except Exception as e:
                     self.logger.error(f"Error consulting {path}: {type(e).__name__} - {e}", exc_info=True)
@@ -236,7 +245,7 @@ class SymbolicReasoner:
             # Rewrite the learned-rule sidecar atomically so partial writes do not
             # leave the Prolog state and on-disk rule set out of sync.
             with open(temp_learned_rules_path, 'w') as f_temp:
-                f_temp.write(f"% Dynamically learned rules for ANSR-DT - Automatically managed\n")
+                f_temp.write("% Dynamically learned rules for ANSR-DT - Automatically managed\n")
                 f_temp.write(f"% Last updated: {datetime.now().isoformat()}\n\n")
                 f_temp.write(":- discontiguous(neural_rule/0).\n")
                 f_temp.write(":- discontiguous(gradient_rule/0).\n")
@@ -435,206 +444,6 @@ class SymbolicReasoner:
         if list(self.prolog.query("correlated(s4, s11).")):
             conditions.append("correlated(s4, s11)")
         return sorted(set(conditions))
-
-    def extract_rules_from_neural_model(
-            self,
-            input_data: np.ndarray,
-            feature_names: List[str],
-            threshold: float = 0.7,
-            model: Optional[Any] = None
-    ) -> List[Tuple[str, float]]:
-        """
-        Extracts potential rule candidates from neural model predictions.
-        Focuses on translating high-confidence anomaly predictions into symbolic preconditions.
-        """
-        try:
-            model_to_use = model if model is not None else self.model
-            if model_to_use is None:
-                self.logger.error("No model available for rule extraction.")
-                return []
-
-            if hasattr(model_to_use, 'built') and not model_to_use.built:
-                self.logger.warning("Keras model not built; attempting build for rule extraction.")
-                if self.input_shape and input_data.shape[1:] == self.input_shape:
-                    try:
-                        _ = model_to_use.predict(input_data[:1].astype(np.float32), verbose=0)
-                    except Exception as e:
-                        self.logger.error(f"Failed to build model during rule extraction: {e}")
-                        return []
-                else:
-                    self.logger.error("Cannot build model: input shape mismatch.")
-                    return []
-
-            if input_data.ndim == 2:
-                if input_data.shape[0] == self.input_shape[0] and input_data.shape[1] == self.input_shape[1]:
-                    input_data = np.expand_dims(input_data, axis=0)
-                else:
-                    self.logger.error(
-                        f"Invalid 2D input shape: {input_data.shape}. Expected ({self.input_shape[0]}, {self.input_shape[1]}).")
-                    return []
-            elif input_data.ndim != 3:
-                self.logger.error(f"Invalid input shape: {input_data.shape}. Expected 3D (batch, timesteps, features).")
-                return []
-
-            if input_data.shape[2] != len(feature_names):
-                self.logger.error(
-                    f"Input data feature dim ({input_data.shape[2]}) != feature_names len ({len(feature_names)}).")
-                return []
-
-            self.logger.debug(f"Rule extraction input data shape: {input_data.shape}")
-            input_data = input_data.astype(np.float32)
-
-            if hasattr(model_to_use, 'positive_proba'):
-                predictions = np.asarray(model_to_use.positive_proba(input_data)).flatten()
-            elif hasattr(model_to_use, 'predict_proba'):
-                proba = np.asarray(model_to_use.predict_proba(input_data))
-                predictions = proba[:, -1].flatten()
-            else:
-                try:
-                    predictions = np.asarray(model_to_use.predict(input_data, verbose=0)).flatten()
-                except TypeError:
-                    predictions = np.asarray(model_to_use.predict(input_data)).flatten()
-            anomaly_indices = np.where(predictions > threshold)[0]
-            self.logger.info(
-                f"Found {len(anomaly_indices)} sequences meeting rule extraction threshold (prediction > {threshold}).")
-
-            if len(anomaly_indices) == 0:
-                return []
-
-            potential_new_rules = []
-            current_learned_rule_count = len(self.learned_rules)
-            unique_rule_bodies_this_batch = set()
-
-            for i, sequence_idx in enumerate(anomaly_indices):
-                sequence = input_data[sequence_idx]
-                if sequence.shape[0] < 2:
-                    self.logger.warning(
-                        f"Skipping sequence index {sequence_idx}: Not enough timesteps ({sequence.shape[0]})")
-                    continue
-
-                current_values = sequence[-1, :]
-                previous_values = sequence[-2, :]
-                self._assert_sensor_snapshot(feature_names, current_values, previous_values)
-                feature_conditions = []
-                condition_confidences = []
-
-                for feat_idx, feat_name in enumerate(feature_names):
-                    try:
-                        feat_value = float(current_values[feat_idx])
-                        prev_value = float(previous_values[feat_idx])
-                        if math.isnan(feat_value) or math.isinf(feat_value) or \
-                                math.isnan(prev_value) or math.isinf(prev_value):
-                            self.logger.debug(f"Skipping feature '{feat_name}' due to NaN/Inf.")
-                            continue
-                        change = abs(feat_value - prev_value)
-                    except (IndexError, ValueError, TypeError) as e:
-                        self.logger.warning(
-                            f"Error processing feature '{feat_name}' (idx {feat_idx}) for rule gen at sequence {sequence_idx}: {e}")
-                        continue
-
-                    try:
-                        if list(self.prolog.query(f"feature_threshold({feat_name}, _, high).")):
-                            feature_conditions.append(f"feature_threshold({feat_name}, _, high)")
-                            high_threshold = self._query_numeric_fact('sensor_high_threshold', feat_name)
-                            if high_threshold is not None:
-                                scale = max(abs(high_threshold) * 0.005, 1e-6)
-                                condition_confidences.append(
-                                    min(1.0, max(0.0, (feat_value - high_threshold) / scale)))
-                        elif list(self.prolog.query(f"feature_threshold({feat_name}, _, low).")):
-                            feature_conditions.append(f"feature_threshold({feat_name}, _, low)")
-                            low_threshold = self._query_numeric_fact('sensor_low_threshold', feat_name)
-                            if low_threshold is not None:
-                                scale = max(abs(low_threshold) * 0.005, 1e-6)
-                                condition_confidences.append(
-                                    min(1.0, max(0.0, (low_threshold - feat_value) / scale)))
-
-                        if list(self.prolog.query(f"feature_gradient({feat_name}, _, high).")):
-                            feature_conditions.append(f"feature_gradient({feat_name}, _, high)")
-                            gradient_threshold = self._query_numeric_fact('gradient_threshold', feat_name)
-                            if gradient_threshold is not None and gradient_threshold > 0:
-                                condition_confidences.append(
-                                    min(1.0, max(0.0, (change - gradient_threshold) / gradient_threshold)))
-
-                        if feat_value > prev_value and list(self.prolog.query(f"trend({feat_name}, increasing).")):
-                            feature_conditions.append(f"trend({feat_name}, increasing)")
-                            condition_confidences.append(0.8)
-                        elif feat_value < prev_value and list(self.prolog.query(f"trend({feat_name}, decreasing).")):
-                            feature_conditions.append(f"trend({feat_name}, decreasing)")
-                            condition_confidences.append(0.8)
-
-                    except Exception as e:
-                        self.logger.warning(
-                            f"Unexpected error querying Prolog for feature '{feat_name}': {type(e).__name__} - {e}")
-                        continue
-
-                try:
-                    if list(self.prolog.query("correlated(s4, s11).")):
-                        feature_conditions.append("correlated(s4, s11)")
-                        condition_confidences.append(0.85)
-                    if list(self.prolog.query("sequence_pattern(hpc_degradation_trend).")):
-                        feature_conditions.append("sequence_pattern(hpc_degradation_trend)")
-                        condition_confidences.append(0.9)
-                except Exception as e:
-                    self.logger.warning(f"Error querying correlation/sequence patterns: {type(e).__name__} - {e}")
-                    continue
-
-                if feature_conditions:
-                    unique_sorted_conditions = sorted(list(set(feature_conditions)))
-                    rule_body = ", ".join(unique_sorted_conditions)
-                    if not rule_body:
-                        continue
-
-                    if rule_body in unique_rule_bodies_this_batch:
-                        continue
-                    unique_rule_bodies_this_batch.add(rule_body)
-
-                    rule_name = f"neural_rule_{current_learned_rule_count + len(potential_new_rules) + 1}"
-                    rule_string = f"{rule_name} :- {rule_body}."
-
-                    neural_confidence = float(predictions[sequence_idx])
-                    avg_condition_confidence = np.mean(condition_confidences) if condition_confidences else 0.0
-                    final_confidence = (neural_confidence * 0.6) + (avg_condition_confidence * 0.4)
-                    final_confidence = max(0.0, min(1.0, final_confidence))
-
-                    potential_new_rules.append((rule_string, final_confidence))
-
-            self.logger.info(
-                f"Generated {len(potential_new_rules)} potential new rule candidates from {len(anomaly_indices)} sequences.")
-            return potential_new_rules
-
-        except Exception as e:
-            self.logger.error(f"Error extracting rules from neural model: {e}", exc_info=True)
-            return []
-
-    def analyze_neural_patterns(
-            self,
-            anomalous_sequences: np.ndarray,
-            normal_sequences: np.ndarray,
-            feature_names: List[str]
-    ) -> List[Tuple[str, float]]:
-        """
-        Analyzes patterns in neural model activations to derive abstract rules.
-        (Experimental - Requires careful validation and refinement).
-        """
-        try:
-            pattern_rules = []
-            if self.model is None:
-                self.logger.error("Cannot analyze patterns: Model not available.")
-                return []
-            if anomalous_sequences.size == 0 or normal_sequences.size == 0:
-                self.logger.warning("Insufficient sequences provided for pattern analysis.")
-                return pattern_rules
-
-            if not hasattr(self.model, 'layers'):
-                self.logger.info("Model has no Keras layers; skipping activation-pattern analysis.")
-                return pattern_rules
-
-            self.logger.info("Activation-pattern analysis is unavailable for non-Keras models.")
-            return pattern_rules
-
-        except Exception as e:
-            self.logger.error(f"Error in analyze_neural_patterns: {e}", exc_info=True)
-            return []
 
     def update_rules(self,
                      potential_new_rules: List[Tuple[str, float]],
@@ -1014,7 +823,6 @@ class SymbolicReasoner:
                 self.logger.warning(
                     f"Error querying base rule '{insight_desc}' ({query_string}): {type(e).__name__} - {e}")
 
-        updated_learned_rules = False
         for rule_string, metadata in list(self.learned_rules.items()):
             try:
                 rule_head_match = re.match(r"^\s*([a-zA-Z0-9_]+)\s*(?::-\s*.*)?\.", rule_string.strip())
@@ -1039,7 +847,6 @@ class SymbolicReasoner:
                     current_activations = metadata.get('activations', 0)
                     self.learned_rules[rule_string]['activations'] = current_activations + 1
                     self.learned_rules[rule_string]['last_activated'] = datetime.now()
-                    updated_learned_rules = True
                     self.logger.debug(
                         f"Learned Rule Activated: {insight} (Total Activations: {current_activations + 1})")
 

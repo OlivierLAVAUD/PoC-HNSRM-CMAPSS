@@ -3,10 +3,12 @@
 Miscellaneous utilities for the SKAB benchmark path.
 """
 
+import importlib.util
 import logging
-import numpy as np
 import os
-from typing import List, Optional, Tuple
+from typing import Optional
+
+import numpy as np
 
 logger = logging.getLogger(__name__)
 
@@ -22,7 +24,6 @@ def set_seed(seed: int = 42) -> None:
 def count_parameters(model) -> int:
     """Count trainable parameters in a Keras model."""
     try:
-        import tensorflow as tf
         return int(model.count_params())
     except Exception:
         # For sklearn models, count differently
@@ -43,11 +44,7 @@ def format_duration(seconds: float) -> str:
 
 def check_tf_available() -> bool:
     """Check if TensorFlow is available."""
-    try:
-        import tensorflow as tf
-        return True
-    except ImportError:
-        return False
+    return importlib.util.find_spec("tensorflow") is not None
 
 
 def validate_file_path(filepath: str, must_exist: bool = True) -> bool:

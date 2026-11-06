@@ -6,6 +6,8 @@ to avoid tensorflow dependency when not needed (Task 8.3).
 
 import logging
 
+import numpy as np
+
 logger = logging.getLogger(__name__)
 
 # Lazy import flag - tensorflow will be imported on demand

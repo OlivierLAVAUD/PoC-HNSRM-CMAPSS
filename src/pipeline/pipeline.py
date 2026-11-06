@@ -29,6 +29,10 @@ from src.evaluation.engine_metrics import (
     compute_engine_metrics,
     export_engine_metrics_csv,
 )
+from src.evaluation.episode_metrics import (
+    compute_episode_metrics,
+    export_episode_metrics_csv,
+)
 from src.evaluation.operational_policy import (
     alert_predictions,
     build_operational_policy_report,
@@ -41,6 +45,7 @@ from src.evaluation.thresholding import (
 from src.experiments.threshold_sensitivity import run_threshold_sensitivity
 from src.features.temporal_features import TemporalFeatureExtractor
 from src.fusion.diagnostics import run_fusion_diagnostics
+from src.fusion.nested_validation import run_nested_validation
 from src.fusion.probability_fusion import (
     ProbabilityFusion,
     evaluate_probability_fusion,
@@ -49,6 +54,7 @@ from src.fusion.probability_fusion import (
 from src.hitl.queue import HITLQueue, REASON_PRIORITY
 from src.models.light_classifier import LightClassifier
 from src.models.rul_regressor import (
+    RULEnsembleRegressor,
     RULLightGBMRegressor,
     out_of_fold_predictions,
 )
@@ -241,6 +247,25 @@ def _validate_model_and_training(config: dict) -> None:
             raise ValueError(
                 "alerting.smoothing_cycles must be an integer >= 1."
             )
+        hysteresis = alerting.get('hysteresis') or {}
+        if hysteresis:
+            enter = hysteresis.get('enter_threshold')
+            exit_value = hysteresis.get('exit_threshold')
+            for name, value in (
+                    ('alerting.hysteresis.enter_threshold', enter),
+                    ('alerting.hysteresis.exit_threshold', exit_value)):
+                if value is not None:
+                    _require_range(value, name, 0.0, 1.0)
+            if enter is not None and exit_value is not None and float(
+                    enter) <= float(exit_value):
+                raise ValueError(
+                    "alerting.hysteresis.enter_threshold must be strictly "
+                    "greater than exit_threshold."
+                )
+            if 'margin' in hysteresis:
+                _require_range(hysteresis['margin'],
+                               'alerting.hysteresis.margin', 0.0, 1.0,
+                               allow_low=False)
 
     rul = config.get('rul_regression', {})
     if rul.get('enabled', False):
@@ -252,6 +277,18 @@ def _validate_model_and_training(config: dict) -> None:
             raise ValueError(
                 "rul_regression.apply_to_architectures must be a list."
             )
+        uncertainty = rul.get('uncertainty') or {}
+        if uncertainty.get('enabled', False):
+            if uncertainty.get('method', 'ensemble') != 'ensemble':
+                raise ValueError(
+                    "rul_regression.uncertainty.method must be 'ensemble'."
+                )
+            if (not isinstance(uncertainty.get('n_models', 5), int)
+                    or uncertainty['n_models'] < 1):
+                raise ValueError(
+                    "rul_regression.uncertainty.n_models must be an integer "
+                    ">= 1."
+                )
 
     fusion = config.get('fusion', {})
     if fusion.get('enabled', False):
@@ -387,6 +424,20 @@ def _validate_model_and_training(config: dict) -> None:
         if (not isinstance(fusion_validation.get('n_repeats', 1), int)
                 or fusion_validation.get('n_repeats', 1) < 1):
             raise ValueError("fusion.validation.n_repeats must be an integer >= 1.")
+
+    nested_validation = config.get('fusion', {}).get(
+        'nested_validation', {}
+    )
+    if nested_validation:
+        if (not isinstance(nested_validation.get('n_splits', 5), int)
+                or nested_validation.get('n_splits', 5) < 2):
+            raise ValueError(
+                "fusion.nested_validation.n_splits must be an integer >= 2."
+            )
+        if not isinstance(nested_validation.get('random_state', 42), int):
+            raise ValueError(
+                "fusion.nested_validation.random_state must be an integer."
+            )
 
     drift = config.get('monitoring', {}).get('drift', {})
     if drift.get('enabled', False):
@@ -1221,14 +1272,24 @@ class ANSRDTPipeline:
                 key: value for key, value in rul_config.items()
                 if key not in {
                     'enabled', 'apply_to_architectures',
-                    'use_as_classifier_feature', 'cv_folds',
+                    'use_as_classifier_feature', 'cv_folds', 'uncertainty',
                 }
             }
             random_state = int(
                 self.config['model'].get('random_state', 42)
             )
+            uncertainty_config = rul_config.get('uncertainty', {}) or {}
+            uncertainty_enabled = bool(
+                uncertainty_config.get('enabled', False)
+            )
+            n_models = int(uncertainty_config.get('n_models', 5))
 
             def make_regressor():
+                if uncertainty_enabled:
+                    return RULEnsembleRegressor(
+                        n_models=n_models, random_state=random_state,
+                        logger=self.logger, **params,
+                    )
                 return RULLightGBMRegressor(
                     random_state=random_state, logger=self.logger, **params
                 )
@@ -1243,6 +1304,9 @@ class ANSRDTPipeline:
             )
             val_rul_prediction = regressor.predict(X_val_model)
             test_rul_prediction = regressor.predict(X_test_model)
+            if uncertainty_enabled:
+                val_distribution = regressor.predict_distribution(X_val_model)
+                test_distribution = regressor.predict_distribution(X_test_model)
             use_as_feature = bool(
                 rul_config.get('use_as_classifier_feature', True)
             )
@@ -1261,7 +1325,9 @@ class ANSRDTPipeline:
             rul_report = {
                 'enabled': True,
                 'applied': True,
-                'model': 'lightgbm',
+                'model': (
+                    'lightgbm_ensemble' if uncertainty_enabled else 'lightgbm'
+                ),
                 'used_as_classifier_feature': use_as_feature,
                 'model_path': paths['rul_regressor'],
                 'metrics': {
@@ -1278,6 +1344,33 @@ class ANSRDTPipeline:
                 'validation_predictions': val_rul_prediction.tolist(),
                 'test_predictions': test_rul_prediction.tolist(),
             }
+            if uncertainty_enabled:
+                rul_report['uncertainty'] = {
+                    'enabled': True,
+                    'method': 'ensemble',
+                    'n_models': n_models,
+                    'use_as_fusion_feature': bool(
+                        uncertainty_config.get(
+                            'use_as_fusion_feature', True
+                        )
+                    ),
+                    'validation': self._uncertainty_summary(val_distribution),
+                    'test': self._uncertainty_summary(test_distribution),
+                }
+                rul_report['validation_uncertainty'] = (
+                    val_distribution['std'].tolist()
+                )
+                rul_report['test_uncertainty'] = (
+                    test_distribution['std'].tolist()
+                )
+                rul_report['validation_interval'] = {
+                    'q10': val_distribution['q10'].tolist(),
+                    'q90': val_distribution['q90'].tolist(),
+                }
+                rul_report['test_interval'] = {
+                    'q10': test_distribution['q10'].tolist(),
+                    'q90': test_distribution['q90'].tolist(),
+                }
             self.logger.info(
                 "RUL regression (validation): %s", rul_report['metrics'][
                     'validation'
@@ -1302,6 +1395,30 @@ class ANSRDTPipeline:
             ),
         }
 
+    @staticmethod
+    def _uncertainty_summary(distribution: Dict[str, np.ndarray]
+                             ) -> Dict[str, Any]:
+        """Summarise an ensemble RUL distribution for the run report."""
+        std = np.asarray(distribution.get('std', []), dtype=float).ravel()
+        width = np.asarray(
+            distribution.get('q90', []), dtype=float
+        ).ravel() - np.asarray(
+            distribution.get('q10', []), dtype=float
+        ).ravel()
+        if not len(std):
+            return {
+                'count': 0, 'mean_std': None, 'median_std': None,
+                'mean_interval_width': None,
+            }
+        return {
+            'count': int(len(std)),
+            'mean_std': float(std.mean()),
+            'median_std': float(np.median(std)),
+            'min_std': float(std.min()),
+            'max_std': float(std.max()),
+            'mean_interval_width': float(width.mean()),
+        }
+
     def _engine_metrics(self, units, cycles, rul, y_true, y_pred,
                         suffix: str = '') -> Dict[str, Any]:
         """Compute and persist per-engine metrics."""
@@ -1317,6 +1434,24 @@ class ANSRDTPipeline:
         )
         return {**metrics, 'csv_path': csv_path}
 
+    def _episode_metrics(self, units, cycles, rul, y_true, y_pred,
+                         suffix: str = '') -> Dict[str, Any]:
+        """Compute and persist episode-level detection metrics."""
+        metrics = compute_episode_metrics(
+            y_true, y_pred, units, cycles, rul
+        )
+        csv_path = export_episode_metrics_csv(
+            metrics,
+            os.path.join(
+                self.config['paths']['results_dir'],
+                f'episode_metrics{suffix}.csv',
+            ),
+        )
+        summary = {
+            key: value for key, value in metrics.items() if key != 'episodes'
+        }
+        return {**summary, 'csv_path': csv_path}
+
     def _alerting_report(self, y_true, scores, units, cycles, rul,
                          threshold: float, suffix: str = '') -> Dict[str, Any]:
         """Compare immediate and confirmed alerts, then persist the report."""
@@ -1329,6 +1464,7 @@ class ANSRDTPipeline:
             smoothing_cycles=int(
                 alerting_config.get('smoothing_cycles', 3)
             ),
+            hysteresis=alerting_config.get('hysteresis'),
         )
         path = os.path.join(
             self.config['paths']['results_dir'],
@@ -1412,6 +1548,16 @@ class ANSRDTPipeline:
                 splits['y_test'], test_pred, suffix=f'{suffix}_test',
             ),
         }
+        episode_metrics = {
+            'validation': self._episode_metrics(
+                splits['val_units'], splits['val_cycles'], splits['val_rul'],
+                splits['y_val'], val_pred, suffix=f'{suffix}_validation',
+            ),
+            'test': self._episode_metrics(
+                splits['test_units'], splits['test_cycles'], splits['test_rul'],
+                splits['y_test'], test_pred, suffix=f'{suffix}_test',
+            ),
+        }
         alerting = self._alerting_report(
             splits['y_test'], test_scores, splits['test_units'],
             splits['test_cycles'], splits['test_rul'], threshold,
@@ -1432,6 +1578,7 @@ class ANSRDTPipeline:
             'validation_metrics': validation_metrics,
             'test_metrics': test_metrics,
             'engine_metrics': engine_metrics,
+            'episode_metrics': episode_metrics,
             'alerting': alerting,
             'rul_regression': prepared['rul_report'],
             'feature_metadata_path': (
@@ -1445,19 +1592,33 @@ class ANSRDTPipeline:
             'threshold': threshold,
         }
 
-    def _collect_fusion_signals(self, X_raw: np.ndarray,
-                                neural_scores: np.ndarray,
-                                predicted_rul: Optional[np.ndarray],
-                                label: str) -> np.ndarray:
-        """Reason over every window and build the logistic-fusion matrix."""
+    def _fusion_feature_order(self) -> list:
+        """Return the configured fusion inputs plus optional RUL uncertainty."""
         fusion_config = self.config.get('fusion', {})
-        feature_order = fusion_config.get(
+        feature_order = list(fusion_config.get(
             'features',
             [
                 'neural_probability', 'symbolic_rule_score',
                 'problog_failure_risk', 'predicted_rul',
             ],
-        )
+        ))
+        uncertainty = self.config.get('rul_regression', {}).get(
+            'uncertainty', {}
+        ) or {}
+        if (uncertainty.get('enabled', False)
+                and uncertainty.get('use_as_fusion_feature', True)
+                and 'rul_uncertainty' not in feature_order):
+            feature_order.append('rul_uncertainty')
+        return feature_order
+
+    def _collect_fusion_signals(self, X_raw: np.ndarray,
+                                neural_scores: np.ndarray,
+                                predicted_rul: Optional[np.ndarray],
+                                label: str,
+                                rul_uncertainty: Optional[np.ndarray] = None
+                                ) -> np.ndarray:
+        """Reason over every window and build the logistic-fusion matrix."""
+        feature_order = self._fusion_feature_order()
         if not self.symbolic_enabled:
             self.logger.info(
                 "Symbolic reasoning disabled; fusion uses zero symbolic "
@@ -1469,6 +1630,7 @@ class ANSRDTPipeline:
             return ProbabilityFusion.build_matrix(
                 neural_scores, zeros, zeros, predicted_rul,
                 feature_order=feature_order,
+                rul_uncertainty=rul_uncertainty,
             )
         reasoner = self._initialise_reasoner()
         with open(PROB_RULES_PATH, 'r') as file:
@@ -1512,6 +1674,7 @@ class ANSRDTPipeline:
         return ProbabilityFusion.build_matrix(
             neural_scores, symbolic_scores, problog_risks,
             predicted_rul, feature_order=feature_order,
+            rul_uncertainty=rul_uncertainty,
         )
 
     def _problog_failure_risk(self, program, sensor_values,
@@ -1546,21 +1709,17 @@ class ANSRDTPipeline:
             splits['X_val'], neural_val_scores,
             prepared['rul_report'].get('validation_predictions'),
             'validation',
+            prepared['rul_report'].get('validation_uncertainty'),
         )
         test_matrix = self._collect_fusion_signals(
             splits['X_test'], neural_test_scores,
             prepared['rul_report'].get('test_predictions'),
             'test',
+            prepared['rul_report'].get('test_uncertainty'),
         )
         fusion_model = ProbabilityFusion(
             random_state=int(self.config['model'].get('random_state', 42)),
-            feature_order=fusion_config.get(
-                'features',
-                [
-                    'neural_probability', 'symbolic_rule_score',
-                    'problog_failure_risk', 'predicted_rul',
-                ],
-            ),
+            feature_order=self._fusion_feature_order(),
             logger=self.logger,
         )
         fusion_model.fit(val_matrix, splits['y_val'])
@@ -1693,6 +1852,9 @@ class ANSRDTPipeline:
         rul_predictions = evaluation.get('rul_regression', {}).get(
             'test_predictions'
         )
+        rul_uncertainties = evaluation.get('rul_regression', {}).get(
+            'test_uncertainty'
+        )
         insight_count = 0
         reasoner = None
         if include_insights and self.symbolic_enabled and len(splits['X_test']):
@@ -1754,6 +1916,7 @@ class ANSRDTPipeline:
             symbolic_score = None
             problog_risk = None
             predicted_rul = None
+            rul_uncertainty = None
             if matrix is not None and features:
                 columns = {
                     name: float(matrix[position, index])
@@ -1762,9 +1925,13 @@ class ANSRDTPipeline:
                 symbolic_score = columns.get('symbolic_rule_score')
                 problog_risk = columns.get('problog_failure_risk')
                 predicted_rul = columns.get('predicted_rul')
+                rul_uncertainty = columns.get('rul_uncertainty')
             if (predicted_rul is None and rul_predictions is not None
                     and len(rul_predictions) == len(scores)):
                 predicted_rul = float(rul_predictions[position])
+            if (rul_uncertainty is None and rul_uncertainties is not None
+                    and len(rul_uncertainties) == len(scores)):
+                rul_uncertainty = float(rul_uncertainties[position])
             trail.add(
                 split='test',
                 window_index=position,
@@ -1784,6 +1951,7 @@ class ANSRDTPipeline:
                 symbolic_rule_score=symbolic_score,
                 problog_failure_risk=problog_risk,
                 predicted_rul=predicted_rul,
+                rul_uncertainty=rul_uncertainty,
                 insights=insights,
                 active_rules=active_rules,
                 data_quality={
@@ -1830,6 +1998,7 @@ class ANSRDTPipeline:
             'operational_policy': {},
             'threshold_sensitivity': {},
             'fusion_diagnostics': {},
+            'fusion_nested_validation': {},
             'drift': {},
             'audit': {},
         }
@@ -1902,6 +2071,19 @@ class ANSRDTPipeline:
                 analyses['fusion_diagnostics'].get('ablation_summary', {}).get(
                     'answer'
                 ),
+            )
+
+        nested_config = fusion_config.get('nested_validation', {})
+        if (fusion.get('applied') and val_matrix is not None
+                and nested_config.get('enabled', False)):
+            analyses['fusion_nested_validation'] = run_nested_validation(
+                val_matrix, splits['y_val'], splits['val_units'],
+                fusion.get('features', []), fusion_config, results_dir,
+            )
+            self.logger.info(
+                "Fusion nested validation: %s folds, mean F1=%s.",
+                analyses['fusion_nested_validation']['folds_evaluated'],
+                analyses['fusion_nested_validation']['metrics']['f1']['mean'],
             )
 
         drift_config = self.config.get('monitoring', {}).get('drift', {})
@@ -2140,6 +2322,19 @@ class ANSRDTPipeline:
         else:
             alerting = evaluation['alerting']
 
+        final_val_pred = (val_scores >= decision_threshold).astype(int)
+        final_test_pred = (test_scores >= decision_threshold).astype(int)
+        episode_metrics = {
+            'validation': self._episode_metrics(
+                splits['val_units'], splits['val_cycles'], splits['val_rul'],
+                splits['y_val'], final_val_pred, suffix='_validation',
+            ),
+            'test': self._episode_metrics(
+                splits['test_units'], splits['test_cycles'], splits['test_rul'],
+                splits['y_test'], final_test_pred, suffix='_test',
+            ),
+        }
+
         explanations = self._explain_representative_windows(
             splits['X_test'], test_scores, decision_threshold
         )
@@ -2176,7 +2371,11 @@ class ANSRDTPipeline:
         }
         rul_report = {
             key: value for key, value in prepared['rul_report'].items()
-            if key not in {'validation_predictions', 'test_predictions'}
+            if key not in {
+                'validation_predictions', 'test_predictions',
+                'validation_uncertainty', 'test_uncertainty',
+                'validation_interval', 'test_interval',
+            }
         }
 
         results = {
@@ -2209,6 +2408,7 @@ class ANSRDTPipeline:
                 'metrics': calibration_report,
             },
             'engine_metrics': engine_metrics,
+            'episode_metrics': episode_metrics,
             'hitl_rule_validation': rule_validation,
             'symbolic_rule_provenance': symbolic_provenance,
             'representative_windows': explanations,
@@ -2216,6 +2416,9 @@ class ANSRDTPipeline:
             'operational_policy': analyses['operational_policy'],
             'threshold_sensitivity': analyses['threshold_sensitivity'],
             'fusion_diagnostics': analyses['fusion_diagnostics'],
+            'fusion_nested_validation': analyses[
+                'fusion_nested_validation'
+            ],
             'drift': analyses['drift'],
             'audit': analyses['audit'],
             'artifacts': {
@@ -2254,6 +2457,15 @@ class ANSRDTPipeline:
                 'fusion_ablation_path': analyses[
                     'fusion_diagnostics'
                 ].get('ablation_path'),
+                'fusion_nested_validation_path': analyses[
+                    'fusion_nested_validation'
+                ].get('path'),
+                'episode_metrics_validation_path': episode_metrics[
+                    'validation'
+                ].get('csv_path'),
+                'episode_metrics_test_path': episode_metrics[
+                    'test'
+                ].get('csv_path'),
                 'drift_report_path': analyses['drift'].get('path'),
                 'decision_audit_path': analyses['audit'].get('journal_path'),
             },
@@ -2325,6 +2537,7 @@ class ANSRDTPipeline:
                     split: details.get('summary', {})
                     for split, details in evaluation['engine_metrics'].items()
                 },
+                'episode_metrics': evaluation.get('episode_metrics', {}),
                 'alerting': evaluation['alerting'].get('modes', {}),
                 'rul_regression': {
                     key: value for key, value in

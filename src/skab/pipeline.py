@@ -5,14 +5,15 @@ and symbolic rule extraction.
 """
 
 import logging
+
 import numpy as np
+
 from src.skab.config import (
-    SKAB_FEATURES, DEFAULT_N_ESTIMATORS, DEFAULT_MAX_DEPTH,
-    DEFAULT_RANDOM_STATE, SYMBOLIC_MIN_SUPPORT, SYMBOLIC_MAX_RULES,
-    SYMBOLIC_MIN_CONFIDENCE
+    DEFAULT_MAX_DEPTH, DEFAULT_N_ESTIMATORS,
+    SYMBOLIC_MAX_RULES, SYMBOLIC_MIN_CONFIDENCE, SYMBOLIC_MIN_SUPPORT,
 )
-from src.skab.data import load_skab_data, describe_data
-from src.skab.model import create_skab_model, SKABClassifier, RandomForestModel
+from src.skab.data import describe_data, load_skab_data
+from src.skab.model import create_skab_model
 from src.reasoning.reasoning import SymbolicReasoner
 
 logger = logging.getLogger(__name__)
@@ -22,6 +23,7 @@ def run_skab_benchmark(
     data_path: str = None,
     model_type: str = "random_forest",
     symbolic: bool = True,
+    epochs: int = 50,
     n_estimators: int = None,
     max_depth: int = None,
     symbolic_min_support: int = None,
@@ -34,6 +36,7 @@ def run_skab_benchmark(
         data_path: Path to SKAB data directory
         model_type: "random_forest" or "keras"
         symbolic: Whether to run symbolic rule extraction
+        epochs: Number of epochs for the optional Keras model
         n_estimators: Number of trees for RF (uses default if None)
         max_depth: Max depth for RF (uses default if None)
         symbolic_min_support: Min support for symbolic rules
@@ -44,7 +47,7 @@ def run_skab_benchmark(
         Dictionary with benchmark results
     """
     # Load data
-    logger.info("Loading SKAB data from: %s", data_path or config.SKAB_DATA_PATH)
+    logger.info("Loading SKAB data from: %s", data_path or "data/SKAB")
     X, y, feature_names = load_skab_data(data_path)
     
     logger.info("SKAB dataset: %d samples, %d features", X.shape[0], X.shape[1])
@@ -57,17 +60,24 @@ def run_skab_benchmark(
     n_est = n_estimators or DEFAULT_N_ESTIMATORS
     depth = max_depth or DEFAULT_MAX_DEPTH
     
-    rf_model = create_skab_model("random_forest", n_estimators=n_est, max_depth=depth)
-    rf_model.fit(X, y)
-    
-    rf_predictions = rf_model.predict(X)
-    rf_accuracy = np.mean(rf_predictions == y)
-    logger.info("Random Forest accuracy: %.4f", rf_accuracy)
-    
+    if model_type == "keras":
+        model = create_skab_model("keras", input_dim=X.shape[1])
+        model.fit(X, y, epochs=epochs)
+    else:
+        model = create_skab_model(
+            "random_forest", n_estimators=n_est, max_depth=depth
+        )
+        model.fit(X, y)
+
+    predictions = model.predict(X)
+    accuracy = float(np.mean(predictions == y))
+    logger.info("%s accuracy: %.4f", model_type, accuracy)
+
     # Initialize symbolic reasoner if requested
     results = {
         'model_type': model_type,
-        'rf_accuracy': rf_accuracy,
+        'rf_accuracy': accuracy,
+        'accuracy': accuracy,
         'symbolic_rules': [],
         'symbolic_evaluated': 0,
         'symbolic_accepted': 0,
@@ -77,6 +87,8 @@ def run_skab_benchmark(
     if symbolic:
         sym_min_support = symbolic_min_support or SYMBOLIC_MIN_SUPPORT
         sym_max_rules = symbolic_max_rules or SYMBOLIC_MAX_RULES
+        if sym_min_support < 1:
+            raise ValueError("symbolic_min_support must be >= 1.")
         sym_min_conf = symbolic_min_confidence or SYMBOLIC_MIN_CONFIDENCE
         
         # Extract rules from the RF model using symbolic reasoning

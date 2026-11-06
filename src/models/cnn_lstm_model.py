@@ -6,7 +6,7 @@ TensorFlow; only calling :func:`create_cnn_lstm_model` does.
 
 from __future__ import annotations
 
-from typing import Optional, Tuple
+from typing import Tuple
 
 try:
     import tensorflow as tf

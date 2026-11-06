@@ -145,6 +145,7 @@ class AuditTrail:
             symbolic_rule_score: Optional[float] = None,
             problog_failure_risk: Optional[float] = None,
             predicted_rul: Optional[float] = None,
+            rul_uncertainty: Optional[float] = None,
             insights: Optional[Iterable[str]] = None,
             active_rules: Optional[Iterable[str]] = None,
             data_quality: Optional[Dict[str, Any]] = None,
@@ -199,6 +200,9 @@ class AuditTrail:
             ),
             'predicted_rul': (
                 None if predicted_rul is None else float(predicted_rul)
+            ),
+            'rul_uncertainty': (
+                None if rul_uncertainty is None else float(rul_uncertainty)
             ),
             'fused_probability': (
                 None if fused_probability is None else float(fused_probability)
@@ -331,7 +335,7 @@ def verify_audit(results_dir: str,
             })
         if record.get('alert_mode') not in {
                 'immediate', 'consecutive_2', 'consecutive_3',
-                'smoothed_3', 'smoothed_5'}:
+                'smoothed_3', 'smoothed_5', 'hysteresis'}:
             issues.append({
                 'type': 'unknown_alert_mode',
                 'detail': f"{identifier}: {record.get('alert_mode')}",

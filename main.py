@@ -119,11 +119,57 @@ def _print_multi_seed_summary(report: dict) -> None:
     print(f"  plot:   {artifacts.get('plot_path')}")
 
 
+def build_parser() -> argparse.ArgumentParser:
+    """Build the CLI parser shared by the FD001 and SKAB entry points."""
+    parser = argparse.ArgumentParser(
+        description='Run the lightweight ANSR-DT PoC.'
+    )
+    parser.add_argument('--clear-results', action='store_true',
+                        help='Clear the results directory before running.')
+    parser.add_argument('--compare-models', action='store_true',
+                        help='Compare RandomForest and LightGBM on validation.')
+    parser.add_argument(
+        '--architecture',
+        choices=['random_forest', 'lightgbm', 'cnn_lstm'],
+        default=None, help='Override model.architecture.',
+    )
+    parser.add_argument('--multi-seed', action='store_true',
+                        help='Re-run the protocol over several split seeds.')
+    parser.add_argument('--seeds', default=None,
+                        help='Comma-separated seeds for --multi-seed (e.g. 42,43,44).')
+    parser.add_argument('--threshold-sensitivity', action='store_true',
+                        help='Sweep validation-selected decision thresholds.')
+    parser.add_argument('--operational-policy', action='store_true',
+                        help='Select the alert mode from maintenance costs.')
+    parser.add_argument(
+        '--benchmark',
+        choices=['fd001', 'skab'],
+        default='fd001',
+        help='Benchmark dataset to use (fd001 or skab).',
+    )
+    from src.skab.run import add_skab_arguments
+    return add_skab_arguments(parser)
+
+
 def main(clear: bool = False, compare_models: bool = False,
          architecture: str = None, multi_seed: bool = False,
          seeds: str = None, threshold_sensitivity: bool = False,
-         operational_policy: bool = False) -> int:
-    """Run the C-MAPSS pipeline and persist a run summary."""
+         operational_policy: bool = False, benchmark: str = 'fd001',
+         modes=None, data_path: str = None,
+         model_type: str = 'random_forest', epochs: int = 50,
+         symbolic: bool = True, min_support: int = 3,
+         max_rules: int = 50, min_confidence: float = 0.7) -> int:
+    """Run the configured benchmark and persist its summary."""
+    if benchmark == 'skab':
+        from src.skab.run import run_skab_from_args
+        skab_args = argparse.Namespace(
+            benchmark='skab', modes=modes or ['random_forest', 'symbolic'],
+            data_path=data_path, model_type=model_type, epochs=epochs,
+            symbolic=symbolic, min_support=min_support,
+            max_rules=max_rules, min_confidence=min_confidence,
+        )
+        return run_skab_from_args(skab_args, project_root=PROJECT_ROOT)
+
     log_path = os.path.join(PROJECT_ROOT, 'logs', 'ansr_dt_main.log')
     os.makedirs(os.path.dirname(log_path), exist_ok=True)
     logger = setup_logging(log_file=log_path, log_level=logging.INFO)
@@ -184,28 +230,7 @@ def main(clear: bool = False, compare_models: bool = False,
 
 
 if __name__ == '__main__':
-    parser = argparse.ArgumentParser(description='Run the lightweight ANSR-DT PoC.')
-    parser.add_argument('--clear-results', action='store_true',
-                        help='Clear the results directory before running.')
-    parser.add_argument('--compare-models', action='store_true',
-                        help='Compare RandomForest and LightGBM on validation.')
-    parser.add_argument('--architecture', choices=['random_forest', 'lightgbm', 'cnn_lstm'],
-                        default=None, help='Override model.architecture.')
-    parser.add_argument('--multi-seed', action='store_true',
-                        help='Re-run the protocol over several split seeds.')
-    parser.add_argument('--seeds', default=None,
-                        help='Comma-separated seeds for --multi-seed (e.g. 42,43,44).')
-    parser.add_argument('--threshold-sensitivity', action='store_true',
-                        help='Sweep validation-selected decision thresholds.')
-    parser.add_argument('--operational-policy', action='store_true',
-                        help='Select the alert mode from maintenance costs.')
-    parser.add_argument(
-        "--benchmark",
-        choices=["fd001", "skab"],
-        default="fd001",
-        help="Benchmark dataset to use (fd001 or skab)."
-    )
-    args = parser.parse_args()
+    args = build_parser().parse_args()
     sys.exit(main(
         clear=args.clear_results,
         compare_models=args.compare_models,
@@ -214,4 +239,13 @@ if __name__ == '__main__':
         seeds=args.seeds,
         threshold_sensitivity=args.threshold_sensitivity,
         operational_policy=args.operational_policy,
+        benchmark=args.benchmark,
+        modes=args.modes,
+        data_path=args.data_path,
+        model_type=args.model_type,
+        epochs=args.epochs,
+        symbolic=args.symbolic,
+        min_support=args.min_support,
+        max_rules=args.max_rules,
+        min_confidence=args.min_confidence,
     ))

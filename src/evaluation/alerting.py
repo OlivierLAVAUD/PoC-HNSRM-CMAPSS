@@ -2,7 +2,7 @@
 
 from __future__ import annotations
 
-from typing import Any, Dict, Iterable, List, Tuple
+from typing import Any, Dict, Iterable, List, Optional, Tuple
 
 import numpy as np
 
@@ -77,6 +77,61 @@ def smoothed_predictions(scores: np.ndarray, unit_ids: np.ndarray,
     return predictions
 
 
+def hysteresis_predictions(scores: np.ndarray, unit_ids: np.ndarray,
+                           cycles: np.ndarray, enter_threshold: float,
+                           exit_threshold: float) -> np.ndarray:
+    """Apply a per-engine hysteresis state machine to risk scores.
+
+    Alerts switch on when the score reaches ``enter_threshold`` and stay on
+    until the score falls strictly below ``exit_threshold``. This avoids
+    alert chattering around a single threshold while preserving early alerts.
+    """
+    values = np.asarray(scores, dtype=float).ravel()
+    enter = float(enter_threshold)
+    exit_value = float(exit_threshold)
+    if not 0.0 <= exit_value < enter <= 1.0:
+        raise ValueError(
+            "Hysteresis thresholds must satisfy 0 <= exit < enter <= 1."
+        )
+    if len(values) != len(np.asarray(unit_ids).ravel()):
+        raise ValueError("Scores and unit_ids must have the same length.")
+    predictions = np.zeros(len(values), dtype=int)
+    _, groups = _ordered_indices(unit_ids, cycles)
+    for indices in groups:
+        in_alert = False
+        for index in indices:
+            if in_alert:
+                if values[index] < exit_value:
+                    in_alert = False
+            elif values[index] >= enter:
+                in_alert = True
+            predictions[index] = int(in_alert)
+    return predictions
+
+
+def resolve_hysteresis_thresholds(threshold: float,
+                                  enter_threshold: Optional[float],
+                                  exit_threshold: Optional[float],
+                                  margin: float = 0.05) -> Tuple[float, float]:
+    """Derive missing hysteresis thresholds from the validation threshold."""
+    base = float(threshold)
+    margin = float(margin)
+    enter = (
+        min(1.0, base + margin)
+        if enter_threshold is None else float(enter_threshold)
+    )
+    exit_value = (
+        max(0.0, base - margin)
+        if exit_threshold is None else float(exit_threshold)
+    )
+    if not 0.0 <= exit_value < enter <= 1.0:
+        raise ValueError(
+            "Hysteresis thresholds must satisfy 0 <= exit < enter <= 1; "
+            f"got enter={enter:.4f}, exit={exit_value:.4f}."
+        )
+    return enter, exit_value
+
+
 def _summary_without_rows(metrics: Dict[str, Any]) -> Dict[str, Any]:
     return dict(metrics.get("summary", {}))
 
@@ -85,8 +140,10 @@ def compare_alerting(y_true: np.ndarray, scores: np.ndarray,
                      unit_ids: np.ndarray, cycles: np.ndarray,
                      rul: np.ndarray, threshold: float,
                      consecutive_ks: Iterable[int] = (2, 3),
-                     smoothing_cycles: int = 3) -> Dict[str, Any]:
-    """Compare immediate, confirmed and smoothed alerts on the same windows."""
+                     smoothing_cycles: int = 3,
+                     hysteresis: Optional[Dict[str, Any]] = None
+                     ) -> Dict[str, Any]:
+    """Compare immediate, confirmed, smoothed and hysteresis alerts."""
     y_true = np.asarray(y_true, dtype=int).ravel()
     scores = np.asarray(scores, dtype=float).ravel()
     threshold = float(threshold)
@@ -116,6 +173,25 @@ def compare_alerting(y_true: np.ndarray, scores: np.ndarray,
             unit_ids, cycles, rul, y_true, smoothed
         ))
 
+    hysteresis_thresholds = None
+    if hysteresis and hysteresis.get('enabled', False):
+        enter, exit_value = resolve_hysteresis_thresholds(
+            threshold,
+            hysteresis.get('enter_threshold'),
+            hysteresis.get('exit_threshold'),
+            margin=float(hysteresis.get('margin', 0.05)),
+        )
+        hysteretic = hysteresis_predictions(
+            scores, unit_ids, cycles, enter, exit_value
+        )
+        modes["hysteresis"] = _summary_without_rows(compute_engine_metrics(
+            unit_ids, cycles, rul, y_true, hysteretic
+        ))
+        hysteresis_thresholds = {
+            "enter_threshold": enter,
+            "exit_threshold": exit_value,
+        }
+
     baseline = modes["immediate"]
     for name, summary in modes.items():
         if name == "immediate":
@@ -139,5 +215,6 @@ def compare_alerting(y_true: np.ndarray, scores: np.ndarray,
         "threshold": threshold,
         "consecutive_ks": sorted({int(value) for value in consecutive_ks}),
         "smoothing_cycles": int(smoothing_cycles),
+        "hysteresis_thresholds": hysteresis_thresholds,
         "modes": modes,
     }

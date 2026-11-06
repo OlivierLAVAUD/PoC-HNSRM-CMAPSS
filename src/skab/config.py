@@ -7,7 +7,7 @@ Contains configuration constants and settings for the SKAB benchmark.
 SKAB_DATA_PATH = "data/SKAB"
 SKAB_DEFAULT_CONFIG = "configs/config_skab_separate.yaml"
 
-# Feature mapping for SKAB (8 features, different from FD001's 7 features)
+# Feature mapping for SKAB (8 features, different from FD001's 14 features)
 SKAB_FEATURES = [
     "air_temperature",
     "process_temperature",
@@ -28,5 +28,3 @@ DEFAULT_RANDOM_STATE = 42
 SYMBOLIC_MIN_SUPPORT = 3
 SYMBOLIC_MAX_RULES = 50
 SYMBOLIC_MIN_CONFIDENCE = 0.7
-
-print("SKAB config loaded")

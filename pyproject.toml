@@ -1,0 +1,15 @@
+[tool.ruff]
+target-version = "py310"
+extend-exclude = [
+    "notebooks",
+    ".agent-cache",
+    "legacy",
+]
+
+[tool.ruff.lint]
+select = ["E4", "E7", "E9", "F"]
+
+[tool.ruff.lint.per-file-ignores]
+# These modules prepend the repository root to sys.path before importing
+# project packages, which forces imports after the path mutation.
+"src/inference/inference.py" = ["E402"]

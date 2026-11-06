@@ -4,6 +4,8 @@ results/
 *.sh
 *.txt
 !requirements.txt
+!requirements-dev.txt
+!requirements-cnn.txt
 
 # Local checks and IDE files
 check_data.py

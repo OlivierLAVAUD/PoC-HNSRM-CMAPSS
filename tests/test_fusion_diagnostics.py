@@ -33,7 +33,9 @@ def build_dataset(n_units=12, per_unit=20, seed=0):
     neural = rng.uniform(0.0, 1.0, total)
     symbolic = rng.uniform(0.0, 1.0, total)
     problog = rng.uniform(0.0, 1.0, total)
-    rul = 60.0 - 50.0 * neural
+    # Keep RUL independent from the neural score: otherwise removing the
+    # neural input leaves an almost perfect proxy and the ablation is moot.
+    rul = rng.uniform(0.0, 60.0, total)
     labels = ((neural + symbolic) > 1.0).astype(int)
     units = np.repeat(np.arange(1, n_units + 1), per_unit)
     matrix = ProbabilityFusion.build_matrix(

@@ -213,6 +213,14 @@ alerting:
   enabled: true
   consecutive_ks: [2, 3]
   smoothing_cycles: 3
+  hysteresis:
+    # Adds a fifth comparison mode. Null thresholds are derived on validation
+    # from the selected fusion threshold (enter = threshold + margin,
+    # exit = threshold - margin) and clipped to [0, 1].
+    enabled: true
+    enter_threshold: null
+    exit_threshold: null
+    margin: 0.05
 
 # ===============================
 # Auxiliary RUL Regression
@@ -230,6 +238,14 @@ rul_regression:
   subsample: 0.9
   colsample_bytree: 0.9
   reg_lambda: 0.0
+  # Optional LightGBM ensemble. Disabled by default: one regressor is fitted
+  # and every metric is unchanged. When enabled, the median prediction is
+  # used and rul_uncertainty can join the validation-fitted fusion.
+  uncertainty:
+    enabled: false
+    method: "ensemble"
+    n_models: 5
+    use_as_fusion_feature: true
 
 # ===============================
 # Validation-only Probability Fusion
@@ -250,6 +266,13 @@ fusion:
     method: "group_kfold"         # group_kfold | repeated_kfold
     n_splits: 5
     n_repeats: 1
+    random_state: 42
+  # Optional engine-grouped nested validation. Production fusion stays fitted
+  # on the whole validation split; this only writes stability metrics to
+  # results/fusion_nested_validation.json.
+  nested_validation:
+    enabled: false
+    n_splits: 5
     random_state: 42
 
 # ===============================

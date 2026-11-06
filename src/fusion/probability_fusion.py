@@ -82,8 +82,10 @@ class ProbabilityFusion:
                      symbolic_rule_score: np.ndarray,
                      problog_failure_risk: np.ndarray,
                      predicted_rul: Optional[np.ndarray] = None,
-                     feature_order: Optional[Iterable[str]] = None) -> np.ndarray:
-        """Align the four fusion inputs into a 2D feature matrix."""
+                     feature_order: Optional[Iterable[str]] = None,
+                     rul_uncertainty: Optional[np.ndarray] = None
+                     ) -> np.ndarray:
+        """Align the fusion inputs into a 2D feature matrix."""
         columns = {
             "neural_probability": np.asarray(
                 neural_probability, dtype=float).ravel(),
@@ -96,6 +98,10 @@ class ProbabilityFusion:
             predicted_rul = np.zeros_like(columns["neural_probability"])
         columns["predicted_rul"] = np.asarray(
             predicted_rul, dtype=float).ravel()
+        if rul_uncertainty is None:
+            rul_uncertainty = np.zeros_like(columns["neural_probability"])
+        columns["rul_uncertainty"] = np.asarray(
+            rul_uncertainty, dtype=float).ravel()
         order = list(feature_order or DEFAULT_FEATURES)
         lengths = {name: len(columns[name]) for name in order}
         if len(set(lengths.values())) != 1:
