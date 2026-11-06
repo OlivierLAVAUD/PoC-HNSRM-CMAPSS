@@ -208,6 +208,17 @@ def build_parser() -> argparse.ArgumentParser:
              'Defaults to experiments.cross_condition.test_conditions.',
     )
     parser.add_argument(
+        '--cross-normalization',
+        choices=['source', 'per_condition'], default=None,
+        help='Label-free target normalisation for --cross-condition.',
+    )
+    parser.add_argument(
+        '--cross-threshold',
+        choices=['source', 'target_alert_rate'], default=None,
+        help='Threshold strategy for --cross-condition: reuse the source '
+             'threshold or match the source validation alert rate.',
+    )
+    parser.add_argument(
         '--benchmark',
         choices=['fd001', 'skab'],
         default='fd001',
@@ -224,6 +235,7 @@ def main(clear: bool = False, compare_models: bool = False,
          cmapss_dataset: str = 'fd001', cross_condition: bool = False,
          robustness_report: bool = False,
          cross_train_dataset: str = None, cross_test_datasets: str = None,
+         cross_normalization: str = None, cross_threshold: str = None,
          modes=None, data_path: str = None,
          model_type: str = 'random_forest', epochs: int = 50,
          symbolic: bool = True, min_support: int = 3,
@@ -264,6 +276,18 @@ def main(clear: bool = False, compare_models: bool = False,
                 PROJECT_ROOT, source_dataset
             )
             config = load_config(config_path)
+            cross_settings = (
+                config.get('experiments', {}) or {}
+            ).get('cross_condition', {}) or {}
+    if cross_normalization or cross_threshold:
+        adaptation = cross_settings.setdefault('adaptation', {})
+        if cross_normalization:
+            adaptation['normalization'] = cross_normalization
+        if cross_threshold:
+            adaptation['threshold_strategy'] = cross_threshold
+        config.setdefault('experiments', {})['cross_condition'] = (
+            cross_settings
+        )
     if architecture:
         config.setdefault('model', {})['architecture'] = architecture
         logger.info("Architecture overridden from CLI: %s", architecture)
@@ -384,6 +408,8 @@ if __name__ == '__main__':
         cross_condition=args.cross_condition,
         cross_train_dataset=args.cross_train_dataset,
         cross_test_datasets=args.cross_test_datasets,
+        cross_normalization=args.cross_normalization,
+        cross_threshold=args.cross_threshold,
         robustness_report=args.robustness_report,
         modes=args.modes,
         data_path=args.data_path,

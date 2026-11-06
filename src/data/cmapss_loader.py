@@ -19,6 +19,7 @@ RAW_COLUMNS: List[str] = (
     ['unit_number', 'cycle', 'op_setting_1', 'op_setting_2', 'op_setting_3']
     + [f's{i}' for i in range(1, 22)]
 )
+OP_COLUMNS: List[str] = ['op_setting_1', 'op_setting_2', 'op_setting_3']
 
 
 class CMAPSSLoader:
@@ -46,6 +47,7 @@ class CMAPSSLoader:
         self.unit_ids: Optional[np.ndarray] = None
         self.window_end_cycles: Optional[np.ndarray] = None
         self.window_rul: Optional[np.ndarray] = None
+        self.window_op_settings: Optional[np.ndarray] = None
         self.last_split_masks: Optional[dict] = None
 
     def _read_frame(self, path: str) -> pd.DataFrame:
@@ -94,10 +96,14 @@ class CMAPSSLoader:
                                                           np.ndarray]:
         """Create per-unit sliding windows, labels, unit ids, cycles and RUL."""
         X_list, y_list, unit_list, cycle_list, rul_list = [], [], [], [], []
+        op_list = []
+        has_ops = all(name in frame.columns for name in OP_COLUMNS)
         for unit, group in frame.groupby('unit_number', sort=True):
             values = group[self.feature_names].to_numpy(dtype=np.float32)
             rul = group['rul'].to_numpy(dtype=np.int64)
             cycles = group['cycle'].to_numpy(dtype=np.int64)
+            ops = (group[OP_COLUMNS].to_numpy(dtype=np.float32)
+                   if has_ops else None)
             if len(values) < self.window_size:
                 self.logger.debug("Skipping unit %s with %d cycles", unit, len(values))
                 continue
@@ -108,11 +114,16 @@ class CMAPSSLoader:
                 unit_list.append(unit)
                 cycle_list.append(int(cycles[end - 1]))
                 rul_list.append(int(rul[end - 1]))
+                if ops is not None:
+                    op_list.append(np.median(ops[start:end], axis=0))
 
         if not X_list:
             raise ValueError(
                 f"No windows produced: window_size={self.window_size} exceeds trajectory lengths"
             )
+        self.window_op_settings = (
+            np.asarray(op_list, dtype=np.float32) if op_list else None
+        )
         return (np.asarray(X_list, dtype=np.float32),
                 np.asarray(y_list, dtype=np.int64),
                 np.asarray(unit_list),
@@ -124,9 +135,13 @@ class CMAPSSLoader:
     ) -> Tuple[np.ndarray, np.ndarray, np.ndarray]:
         """Create windows for inference where true RUL labels are unavailable."""
         X_list, unit_list, cycle_list = [], [], []
+        op_list = []
+        has_ops = all(name in frame.columns for name in OP_COLUMNS)
         for unit, group in frame.groupby('unit_number', sort=True):
             values = group[self.feature_names].to_numpy(dtype=np.float32)
             cycles = group['cycle'].to_numpy(dtype=np.int64)
+            ops = (group[OP_COLUMNS].to_numpy(dtype=np.float32)
+                   if has_ops else None)
             if len(values) < self.window_size:
                 self.logger.debug("Skipping unit %s with %d cycles", unit, len(values))
                 continue
@@ -135,11 +150,16 @@ class CMAPSSLoader:
                 X_list.append(values[start:end])
                 unit_list.append(unit)
                 cycle_list.append(int(cycles[end - 1]))
+                if ops is not None:
+                    op_list.append(np.median(ops[start:end], axis=0))
 
         if not X_list:
             raise ValueError(
                 f"No windows produced: window_size={self.window_size} exceeds trajectory lengths"
             )
+        self.window_op_settings = (
+            np.asarray(op_list, dtype=np.float32) if op_list else None
+        )
         return (np.asarray(X_list, dtype=np.float32),
                 np.asarray(unit_list),
                 np.asarray(cycle_list, dtype=np.int64))

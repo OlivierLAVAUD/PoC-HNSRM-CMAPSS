@@ -218,6 +218,14 @@ experiments:
     enabled: false
     train_conditions: []      # e.g. ["fd001"]
     test_conditions: []       # e.g. ["fd002", "fd004"]
+    # Label-free adaptation. Both corrections inspect unlabelled target
+    # features only; the report labels this as transductive and keeps target
+    # labels reporting-only. Defaults reproduce the strict zero-shot protocol.
+    adaptation:
+      normalization: "source"        # source | per_condition
+      threshold_strategy: "source"   # source | target_alert_rate
+      n_conditions: null             # defaults to dataset.operating_conditions
+      random_state: 42
 
 # ===============================
 # Threshold Sensitivity Analysis

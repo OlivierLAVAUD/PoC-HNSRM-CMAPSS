@@ -409,6 +409,35 @@ def _validate_model_and_training(config: dict) -> None:
                     "Cross-condition train and test conditions must be "
                     f"disjoint, got overlap: {sorted(overlap)}."
                 )
+        adaptation = cross_condition.get('adaptation', {}) or {}
+        normalization = adaptation.get('normalization', 'source')
+        if normalization not in ('source', 'per_condition'):
+            raise ValueError(
+                "experiments.cross_condition.adaptation.normalization must "
+                "be 'source' or 'per_condition'."
+            )
+        threshold_strategy = adaptation.get(
+            'threshold_strategy', 'source'
+        )
+        if threshold_strategy not in ('source', 'target_alert_rate'):
+            raise ValueError(
+                "experiments.cross_condition.adaptation.threshold_strategy "
+                "must be 'source' or 'target_alert_rate'."
+            )
+        n_conditions = adaptation.get('n_conditions')
+        if n_conditions is not None and (
+                not isinstance(n_conditions, int)
+                or isinstance(n_conditions, bool)
+                or n_conditions < 1):
+            raise ValueError(
+                "experiments.cross_condition.adaptation.n_conditions must "
+                "be an integer >= 1."
+            )
+        if not isinstance(adaptation.get('random_state', 42), int):
+            raise ValueError(
+                "experiments.cross_condition.adaptation.random_state must "
+                "be an integer."
+            )
 
     prioritization = config.get('hitl', {}).get('prioritization', {})
     if prioritization:
@@ -1801,6 +1830,20 @@ class ANSRDTPipeline:
         labels are used only to report metrics, never to fit or select.
         """
         X_model = self.transform_external_windows(prepared, X_raw)
+        return self.evaluate_external_model_input(
+            prepared, X_model, y_true, units, cycles, rul, threshold,
+        )
+
+    def evaluate_external_model_input(
+            self, prepared: Dict[str, Any], X_model: np.ndarray,
+            y_true: np.ndarray, units: np.ndarray, cycles: np.ndarray,
+            rul: np.ndarray, threshold: float) -> Dict[str, Any]:
+        """Score model-ready external windows with an explicit threshold.
+
+        Adaptation experiments pass condition-normalised inputs here; target
+        labels remain reporting-only.
+        """
+        X_model = np.asarray(X_model, dtype=np.float32)
         scores = self.model.positive_proba(X_model)
         predictions = (scores >= float(threshold)).astype(int)
         metrics = self._compute_metrics(y_true, predictions, scores)

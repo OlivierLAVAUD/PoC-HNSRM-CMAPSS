@@ -3,9 +3,20 @@
 
 The source dataset is split, calibrated and thresholded exactly as in the
 normal pipeline. The fitted model, scaler/extractor and threshold are then
-applied unchanged to the official test engines of each target dataset. Target
-labels are used only to compute reporting metrics: no target window ever
-participates in training, calibration, threshold selection or feature fitting.
+applied to the official test engines of each target dataset. Target labels are
+used only to compute reporting metrics: no target window ever participates in
+training, calibration or feature fitting.
+
+The optional adaptation block separates two label-free corrections:
+
+* ``normalization: per_condition`` standardises target windows with statistics
+  fitted per operating condition on the unlabelled target test set;
+* ``threshold_strategy: target_alert_rate`` matches the alert rate observed on
+  the source validation split instead of reusing its raw threshold.
+
+Both are transductive and are reported as such.  When enabled, the report
+contains the full 2x2 ablation (source/per-condition normalisation x
+source/alert-rate threshold) so the effect of each correction is visible.
 """
 
 from __future__ import annotations
@@ -19,6 +30,12 @@ from typing import Any, Dict, List, Optional, Sequence
 
 import numpy as np
 
+from src.experiments.condition_adaptation import (
+    ConditionNormalizer,
+    achieved_alert_rate,
+    select_alert_rate_threshold,
+)
+
 CSV_FIELDS = [
     'target_dataset', 'architecture', 'threshold', 'windows', 'engines',
     'accuracy', 'precision', 'recall', 'f1', 'roc_auc', 'average_precision',
@@ -31,8 +48,15 @@ CSV_FIELDS = [
     'relative_degradation_f1', 'relative_degradation_recall',
     'relative_degradation_precision',
     'relative_degradation_average_precision',
+    'variant', 'normalization', 'threshold_strategy',
+    'source_validation_alert_rate', 'target_alert_rate',
+    'baseline_f1', 'baseline_precision', 'baseline_recall',
+    'baseline_false_alarm_episodes',
     'target_source',
 ]
+
+ADAPTATION_NORMALIZATIONS = ('source', 'per_condition')
+ADAPTATION_THRESHOLDS = ('source', 'target_alert_rate')
 
 
 def _relative_degradation(source_value: Any, target_value: Any) -> Optional[float]:
@@ -45,6 +69,70 @@ def _relative_degradation(source_value: Any, target_value: Any) -> Optional[floa
     if not np.isfinite(source) or not np.isfinite(target) or source == 0.0:
         return None
     return float((source - target) / abs(source))
+
+
+def _adaptation_settings(config: Dict[str, Any]) -> Dict[str, Any]:
+    """Read and validate the label-free cross-condition adaptation block."""
+    section = (config.get('experiments', {}) or {}).get(
+        'cross_condition', {}
+    ) or {}
+    adaptation = section.get('adaptation', {}) or {}
+    normalization = str(
+        adaptation.get('normalization', 'source')
+    ).strip().lower()
+    threshold_strategy = str(
+        adaptation.get('threshold_strategy', 'source')
+    ).strip().lower()
+    if normalization not in ADAPTATION_NORMALIZATIONS:
+        raise ValueError(
+            f"Unsupported cross-condition normalization: {normalization!r}. "
+            f"Allowed: {list(ADAPTATION_NORMALIZATIONS)}."
+        )
+    if threshold_strategy not in ADAPTATION_THRESHOLDS:
+        raise ValueError(
+            "Unsupported cross-condition threshold strategy: "
+            f"{threshold_strategy!r}. Allowed: {list(ADAPTATION_THRESHOLDS)}."
+        )
+    n_conditions = adaptation.get('n_conditions')
+    if n_conditions is not None and (
+            not isinstance(n_conditions, int) or isinstance(n_conditions, bool)
+            or n_conditions < 1):
+        raise ValueError(
+            "experiments.cross_condition.adaptation.n_conditions must be an "
+            "integer >= 1."
+        )
+    return {
+        'normalization': normalization,
+        'threshold_strategy': threshold_strategy,
+        'n_conditions': n_conditions,
+        'random_state': int(adaptation.get('random_state', 42)),
+    }
+
+
+def _primary_variant(normalization: str, threshold_strategy: str) -> str:
+    """Return the report variant selected by the configuration."""
+    if (normalization == 'per_condition'
+            and threshold_strategy == 'target_alert_rate'):
+        return 'per_condition_alert_rate'
+    if normalization == 'per_condition':
+        return 'per_condition'
+    if threshold_strategy == 'target_alert_rate':
+        return 'alert_rate'
+    return 'zero_shot'
+
+
+def _variant(evaluation: Dict[str, Any], threshold: float) -> Dict[str, Any]:
+    """Keep the reporting payload of one evaluation variant."""
+    return {
+        'threshold': float(threshold),
+        'achieved_alert_rate': achieved_alert_rate(
+            evaluation['scores'], threshold
+        ),
+        'metrics': evaluation['metrics'],
+        'calibration': evaluation.get('calibration', {}),
+        'engine_metrics': evaluation['engine_metrics'],
+        'episode_metrics': evaluation['episode_metrics'],
+    }
 
 
 def _target_specs(targets: Sequence[Any]) -> List[Dict[str, Any]]:
@@ -86,7 +174,14 @@ def _metric_row(name: str, architecture: str, threshold: float,
                 engine: Dict[str, Any], episode: Dict[str, Any],
                 calibration: Dict[str, Any],
                 source_validation: Dict[str, Any],
-                target_source: str) -> Dict[str, Any]:
+                target_source: str, *,
+                variant: str = 'zero_shot',
+                normalization: str = 'source',
+                threshold_strategy: str = 'source',
+                source_validation_alert_rate: Optional[float] = None,
+                target_alert_rate: Optional[float] = None,
+                baseline_metrics: Optional[Dict[str, Any]] = None
+                ) -> Dict[str, Any]:
     """Build one target row, including relative degradation vs validation."""
     keys = ('f1', 'recall', 'precision', 'average_precision')
     degradation = {
@@ -95,6 +190,7 @@ def _metric_row(name: str, architecture: str, threshold: float,
         )
         for key in keys
     }
+    baseline = baseline_metrics or {}
     return {
         'target_dataset': name,
         'architecture': architecture,
@@ -123,6 +219,17 @@ def _metric_row(name: str, architecture: str, threshold: float,
             'average_precision'
         ),
         **degradation,
+        'variant': variant,
+        'normalization': normalization,
+        'threshold_strategy': threshold_strategy,
+        'source_validation_alert_rate': source_validation_alert_rate,
+        'target_alert_rate': target_alert_rate,
+        'baseline_f1': baseline.get('f1'),
+        'baseline_precision': baseline.get('precision'),
+        'baseline_recall': baseline.get('recall'),
+        'baseline_false_alarm_episodes': baseline.get(
+            'false_alarm_episodes'
+        ),
         'target_source': target_source,
     }
 
@@ -167,10 +274,18 @@ def run_cross_condition(
         targets: Sequence[Any], logger: Any,
         results_dir: Optional[str] = None,
         architecture: Optional[str] = None) -> Dict[str, Any]:
-    """Train on one condition and evaluate unchanged on other conditions."""
+    """Train on one condition and evaluate on other conditions.
+
+    The optional adaptation block inspects unlabelled target features only.
+    Target labels remain reporting-only.
+    """
     from src.pipeline.pipeline import ANSRDTPipeline
 
     source_config = copy.deepcopy(source_config)
+    adaptation = _adaptation_settings(source_config)
+    normalization = adaptation['normalization']
+    threshold_strategy = adaptation['threshold_strategy']
+    primary_name = _primary_variant(normalization, threshold_strategy)
     source_dataset = _dataset_id(source_config)
     base_dir = os.path.abspath(
         results_dir or source_config['paths']['results_dir']
@@ -189,8 +304,9 @@ def run_cross_condition(
     )['enabled'] = False
 
     logger.info(
-        "Cross-condition source %s: training and validation-only threshold.",
-        source_dataset,
+        "Cross-condition source %s: training and validation-only threshold "
+        "(normalization=%s, threshold=%s).",
+        source_dataset, normalization, threshold_strategy,
     )
     source = ANSRDTPipeline(source_config, source_config_path, logger)
     splits = source.load_splits()
@@ -203,6 +319,10 @@ def run_cross_condition(
     source_eval = source._evaluate_architecture(prepared, splits)
     threshold = float(source_eval['threshold'])
     source_calibration = source_eval.get('calibration_report') or {}
+    source_validation_scores = np.asarray(source_eval['val_scores'])
+    source_alert_rate = float(np.mean(
+        source_validation_scores >= threshold
+    ))
     source_metrics = {
         'validation': source_eval['validation_metrics'],
         'test': source_eval['test_metrics'],
@@ -216,6 +336,7 @@ def run_cross_condition(
             for split in ('validation', 'test')
         },
         'threshold': threshold,
+        'validation_alert_rate': source_alert_rate,
         'test_source': splits['test_source'],
         'dataset': source.dataset_name,
     }
@@ -253,25 +374,131 @@ def run_cross_condition(
         units = np.asarray(target.data_loader.unit_ids)
         cycles = np.asarray(target.data_loader.window_end_cycles)
         rul = np.asarray(target.data_loader.window_rul)
-        X_target = source._sanitize_non_finite(X_target, f'cross-{name}')
-        evaluation = source.evaluate_external_windows(
-            prepared, X_target, y_target, units, cycles, rul, threshold,
+        op_settings = getattr(
+            target.data_loader, 'window_op_settings', None
         )
-        row = _metric_row(
+        X_target = source._sanitize_non_finite(X_target, f'cross-{name}')
+
+        baseline_input = source.transform_external_windows(
+            prepared, X_target
+        )
+        baseline_eval = source.evaluate_external_model_input(
+            prepared, baseline_input, y_target, units, cycles, rul, threshold,
+        )
+        variants = {'zero_shot': _variant(baseline_eval, threshold)}
+
+        adapted_input = None
+        normalizer = None
+        if normalization == 'per_condition':
+            if (prepared.get('uses_temporal_features')
+                    or prepared.get('scaler') is None):
+                raise ValueError(
+                    "cross_condition.adaptation.normalization='per_condition' "
+                    "requires a source architecture with a fitted scaler "
+                    "(for example random_forest). LightGBM uses raw window "
+                    "features and cannot reuse per-condition z-scores safely."
+                )
+            if op_settings is None:
+                raise ValueError(
+                    f"Cross-condition target {name} has no operating settings; "
+                    "per-condition normalization is unavailable."
+                )
+            n_conditions = adaptation['n_conditions']
+            if n_conditions is None:
+                n_conditions = int(
+                    (target_config.get('dataset', {}) or {}).get(
+                        'operating_conditions', 1
+                    )
+                )
+            normalizer = ConditionNormalizer.fit(
+                op_settings, X_target, n_conditions,
+                random_state=adaptation['random_state'],
+            )
+            adapted_input = normalizer.transform(X_target, op_settings)
+            adapted_eval = source.evaluate_external_model_input(
+                prepared, adapted_input, y_target, units, cycles, rul,
+                threshold,
+            )
+            variants['per_condition'] = _variant(adapted_eval, threshold)
+            logger.info(
+                "Cross-condition %s: fitted %d condition(s) on unlabelled "
+                "target windows (%s).", name, normalizer.n_conditions,
+                normalizer.condition_counts,
+            )
+
+        if threshold_strategy == 'target_alert_rate':
+            baseline_threshold = select_alert_rate_threshold(
+                baseline_eval['scores'], source_alert_rate
+            )
+            baseline_alert_eval = source.evaluate_external_model_input(
+                prepared, baseline_input, y_target, units, cycles, rul,
+                baseline_threshold,
+            )
+            variants['alert_rate'] = _variant(
+                baseline_alert_eval, baseline_threshold
+            )
+            if adapted_input is not None:
+                adapted_scores = source.model.positive_proba(adapted_input)
+                adapted_threshold = select_alert_rate_threshold(
+                    adapted_scores, source_alert_rate,
+                )
+                adapted_alert_eval = source.evaluate_external_model_input(
+                    prepared, adapted_input, y_target, units, cycles, rul,
+                    adapted_threshold,
+                )
+                variants['per_condition_alert_rate'] = _variant(
+                    adapted_alert_eval, adapted_threshold
+                )
+
+        primary = variants[primary_name]
+        baseline_row = _metric_row(
             name, source_architecture, threshold, len(y_target),
-            int(len(np.unique(units))), evaluation['metrics'],
-            evaluation['engine_metrics'], evaluation['episode_metrics'],
-            evaluation.get('calibration', {}),
+            int(len(np.unique(units))), variants['zero_shot']['metrics'],
+            variants['zero_shot']['engine_metrics'],
+            variants['zero_shot']['episode_metrics'],
+            variants['zero_shot']['calibration'],
             source_eval['validation_metrics'],
             target_config['paths']['test_file'],
+            variant='zero_shot',
+            normalization='source',
+            threshold_strategy='source',
+            source_validation_alert_rate=source_alert_rate,
+            target_alert_rate=variants['zero_shot']['achieved_alert_rate'],
+        )
+        row = _metric_row(
+            name, source_architecture, primary['threshold'], len(y_target),
+            int(len(np.unique(units))), primary['metrics'],
+            primary['engine_metrics'], primary['episode_metrics'],
+            primary['calibration'], source_eval['validation_metrics'],
+            target_config['paths']['test_file'],
+            variant=primary_name,
+            normalization=normalization,
+            threshold_strategy=threshold_strategy,
+            source_validation_alert_rate=source_alert_rate,
+            target_alert_rate=primary['achieved_alert_rate'],
+            baseline_metrics=baseline_row,
         )
         rows.append(row)
         target_reports[name] = {
             'dataset': target.dataset_name,
-            'metrics': evaluation['metrics'],
-            'calibration': evaluation.get('calibration', {}),
-            'engine_metrics': evaluation['engine_metrics'],
-            'episode_metrics': evaluation['episode_metrics'],
+            'metrics': primary['metrics'],
+            'calibration': primary['calibration'],
+            'engine_metrics': primary['engine_metrics'],
+            'episode_metrics': primary['episode_metrics'],
+            'variants': variants,
+            'baseline': variants['zero_shot'],
+            'selected_variant': primary_name,
+            'adaptation': {
+                'normalization': normalization,
+                'threshold_strategy': threshold_strategy,
+                'n_conditions': (
+                    normalizer.n_conditions if normalizer is not None else None
+                ),
+                'condition_counts': (
+                    normalizer.condition_counts
+                    if normalizer is not None else None
+                ),
+            },
             'relative_degradation_vs_source_validation': {
                 key: row[f'relative_degradation_{key}']
                 for key in ('f1', 'recall', 'precision', 'average_precision')
@@ -281,9 +508,16 @@ def run_cross_condition(
             'engines': int(len(np.unique(units))),
         }
         logger.info(
-            "Cross-condition %s -> %s: F1=%.4f recall=%.4f precision=%.4f",
-            source_dataset, name, float(row['f1'] or 0.0),
-            float(row['recall'] or 0.0), float(row['precision'] or 0.0),
+            "Cross-condition %s -> %s (%s): F1=%.4f recall=%.4f "
+            "precision=%.4f false_alarm_episodes=%s (zero-shot F1=%.4f, "
+            "precision=%.4f).",
+            source_dataset, name, primary_name,
+            float(primary['metrics'].get('f1') or 0.0),
+            float(primary['metrics'].get('recall') or 0.0),
+            float(primary['metrics'].get('precision') or 0.0),
+            primary['episode_metrics'].get('false_alarm_episodes'),
+            float(variants['zero_shot']['metrics'].get('f1') or 0.0),
+            float(variants['zero_shot']['metrics'].get('precision') or 0.0),
         )
 
     report = {
@@ -295,7 +529,18 @@ def run_cross_condition(
             'architecture': source_architecture,
             'selection_split': 'source_validation',
             'target_usage': 'reporting_only',
-            'source_transforms_reused': True,
+            'variant': primary_name,
+            'normalization': normalization,
+            'threshold_strategy': threshold_strategy,
+            'adaptation_usage': (
+                'none'
+                if normalization == 'source' and threshold_strategy == 'source'
+                else 'unlabeled_target_features'
+            ),
+            'source_transforms_reused': normalization == 'source',
+            'source_threshold_reused': threshold_strategy == 'source',
+            'source_validation_alert_rate': source_alert_rate,
+            'variants_evaluated': list(variants),
             'threshold': threshold,
             'degradation_reference': 'source_validation',
         },

@@ -4,6 +4,39 @@ All notable changes to `poc-hnsrm-cmapss` are documented here. The project is a
 research proof of concept; entries describe evaluation-protocol changes rather
 than production releases.
 
+## [1.8.0] - 2026-11-06
+
+### Added
+
+- **Label-free cross-condition adaptation ablation.**
+  `experiments.cross_condition.adaptation` and the CLI flags
+  `--cross-normalization` / `--cross-threshold` add a 2x2 ablation:
+  source vs per-condition standardisation, crossed with the source threshold
+  vs a threshold matched to the source validation alert rate. Per-condition
+  statistics are fitted on unlabelled target operating settings and windows;
+  target labels remain reporting-only. `ConditionNormalizer` clusters the
+  three operating settings and standardises each condition separately;
+  `select_alert_rate_threshold` chooses the achievable threshold closest to
+  the requested rate, accounting for tied scores.
+- `CMAPSSLoader.window_op_settings` exposes the median operating settings of
+  each window. Cross-condition reports now include `variants`, `baseline_*`
+  columns, achieved target alert rate and the adaptation metadata.
+
+### Finding
+
+- On the real FD001 -> FD002/FD003/FD004 run, per-condition scaling alone
+  produced zero alerts on FD002/FD004 and slightly degraded ROC-AUC. Matching
+  the source alert rate improved F1 on FD002/FD004 only by cutting recall to
+  `0.28-0.32` (thousands of false-alarm episodes remained), and degraded FD003
+  from F1 `0.493` to `0.175`. Simple label-free adaptation is not a solution;
+  the ranking itself is near chance on the multi-condition targets.
+
+### Tests
+
+- Condition-normalizer fitting/transform, single-condition fallback, input
+  validation, alert-rate threshold behaviour and the full cross-condition
+  ablation metadata.
+
 ## [1.7.0] - 2026-11-06
 
 ### Added

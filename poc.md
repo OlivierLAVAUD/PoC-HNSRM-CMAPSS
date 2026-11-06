@@ -197,7 +197,7 @@ src/
 - `results/` - Run-specific subdirectories
   - `results/alert_policy_comparison.json` / `.csv` - Episode-level alert-policy comparison (validation selection, test reporting only)
   - `results/symbolic_contribution.json` - Diagnostic signal- and rule-level ablation of the Prolog/ProbLog inputs
-  - `results/cross_condition_report.json` / `cross_condition_summary.csv` - Cross-condition generalisation (after `--cross-condition`)
+  - `results/cross_condition_report.json` / `cross_condition_summary.csv` - Cross-condition generalisation and the 2x2 label-free adaptation ablation (after `--cross-condition`)
   - `results/robustness_report.json` / `.csv` / `.md` and `results/visualization/robustness_report.png` - Consolidated robustness dossier
   - `results/fd002/`, `results/fd003/`, `results/fd004/` - Per-subset benchmark outputs
   - `results/skab_separate/` - SKAB benchmark outputs
@@ -236,6 +236,10 @@ python main.py --cmapss-dataset fd004
 
 # Cross-condition generalisation: fit FD001, report on other subsets unchanged
 python main.py --cross-condition --cross-test-datasets fd002,fd004
+
+# Label-free adaptation ablation: per-condition scaling x alert-rate threshold
+python main.py --cross-condition --cross-test-datasets fd002,fd003,fd004 \
+  --cross-normalization per_condition --cross-threshold target_alert_rate
 
 # Consolidated robustness dossier from the artifacts in results/
 python main.py --robustness-report

@@ -4,6 +4,7 @@ import os
 import tempfile
 import unittest
 
+import numpy as np
 import pandas as pd
 
 from src.data.cmapss_loader import CMAPSSLoader, RAW_COLUMNS, USEFUL_SENSORS
@@ -41,6 +42,8 @@ class TestCMAPSSLoader(unittest.TestCase):
             self.assertEqual(y.shape, (expected_windows,))
             self.assertGreater(int(y.sum()), 0)
             self.assertEqual(len(set(loader.unit_ids.tolist())), 3)
+            self.assertEqual(loader.window_op_settings.shape, (expected_windows, 3))
+            self.assertTrue(np.allclose(loader.window_op_settings[:, 2], 100.0))
 
     def test_unit_split_is_disjoint(self):
         with tempfile.TemporaryDirectory() as tmpdir:

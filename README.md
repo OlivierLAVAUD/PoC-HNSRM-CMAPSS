@@ -197,6 +197,10 @@ python main.py --cmapss-dataset fd004
 # Cross-condition generalisation: train on FD001, report on other subsets
 python main.py --cross-condition --cross-test-datasets fd002,fd004
 
+# Label-free adaptation ablation: per-condition scaling x alert-rate threshold
+python main.py --cross-condition --cross-test-datasets fd002,fd003,fd004 \
+  --cross-normalization per_condition --cross-threshold target_alert_rate
+
 # Consolidate every robustness artifact into one dossier
 python main.py --robustness-report
 
@@ -416,29 +420,59 @@ The degraded window is a useful HITL example: its neural probability sits on the
 
 ### Cross-condition generalisation
 
-FD001 has one operating condition, while FD002-FD004 mix several. `python main.py --cross-condition --cross-train-dataset fd001 --cross-test-datasets fd002,fd004` trains, calibrates and thresholds the source dataset on its own training/validation engines, then applies the frozen transforms, model and threshold to each target dataset's official test engines. Target engines are never used to fit, calibrate, select a threshold or adjust the fusion; their labels only compute reporting metrics.
+FD001 has one operating condition, while FD002-FD004 mix several. `python main.py --cross-condition --cross-train-dataset fd001 --cross-test-datasets fd002,fd003,fd004` trains, calibrates and thresholds the source dataset on its own training/validation engines, then applies the frozen model to each target dataset's official test engines. Target engines are never used to fit, calibrate, select a threshold or adjust the fusion; their labels only compute reporting metrics.
 
-The report is written to `results/cross_condition_report.json` and `results/cross_condition_summary.csv`. Each target row contains F1, precision, recall, ROC-AUC, average precision, Brier score, ECE, engine recall/precision, episode recall/precision, false-alarm episodes, mean anticipation, and the relative degradation of F1/recall/precision/average precision against the source intra-condition *validation* metrics. The same protocol can be enabled in configuration with:
+Two protocols are reported:
+
+1. **Zero-shot** (default): the source scaler, calibration and threshold are reused unchanged.
+2. **Label-free adaptation**: `normalization: per_condition` fits a z-score per operating condition on the *unlabelled* target test windows, and `threshold_strategy: target_alert_rate` chooses the target threshold that best matches the alert rate observed on the source validation split. Both are transductive: they inspect target features/scores, never target labels.
+
+```bash
+python main.py --cross-condition --cross-test-datasets fd002,fd003,fd004
+python main.py --cross-condition --cross-test-datasets fd002,fd003,fd004 \
+  --cross-normalization per_condition --cross-threshold target_alert_rate
+```
 
 ```yaml
 experiments:
   cross_condition:
     enabled: true
     train_conditions: ["fd001"]
-    test_conditions: ["fd002", "fd004"]
+    test_conditions: ["fd002", "fd003", "fd004"]
+    adaptation:
+      normalization: "per_condition"        # source | per_condition
+      threshold_strategy: "target_alert_rate"  # source | target_alert_rate
 ```
 
-The table below is a real run of the protocol above: RandomForest trained on FD001 engines, validation-selected threshold `0.1357`, symbolic layer disabled (no SWI-Prolog in the execution environment), applied unchanged to the official test engines of FD002-FD004. Artifacts: `results/cross_condition_report.json` and `results/cross_condition_summary.csv`.
+The report is written to `results/cross_condition_report.json` and `results/cross_condition_summary.csv`. The primary row follows the configured variant; `targets.<name>.variants` always contains the full 2x2 ablation, and the CSV keeps the zero-shot `baseline_*` columns next to the selected row.
 
-| Target | Windows | Engines | F1 | Precision | Recall | ROC-AUC | Avg. precision | Brier | ECE | Episode recall | Episode precision | False-alarm ep. | ΔF1 vs FD001 val |
-|---|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|
-| FD002 | 26,505 | 253 | 0.0819 | 0.0429 | 0.8942 | 0.5798 | 0.0573 | 0.0541 | 0.1215 | 0.9836 | 0.0477 | 2,836 | +0.9013 (degradation) |
-| FD003 | 13,696 | 100 | 0.4932 | 0.7219 | 0.3746 | 0.9458 | 0.4423 | 0.0157 | 0.0036 | 0.6000 | 0.9048 | 2 | +0.4056 (degradation) |
-| FD004 | 34,081 | 237 | 0.0514 | 0.0264 | 0.9074 | 0.5983 | 0.0419 | 0.0439 | 0.1381 | 1.0000 | 0.0319 | 3,365 | +0.9381 (degradation) |
+The table below is a real run on FD002-FD004: RandomForest trained on FD001, validation threshold `0.1357`, source validation alert rate `0.2106`. Values are F1 / precision / recall / false-alarm episodes / episode recall / ROC-AUC. Artifacts are local and ignored by Git.
+
+| Target | Variant | F1 | Precision | Recall | False-alarm ep. | Episode recall | ROC-AUC | Target threshold | Achieved alert rate |
+|---|---|---:|---:|---:|---:|---:|---:|---:|---:|
+| FD002 | zero-shot | 0.0819 | 0.0429 | 0.8942 | 2,836 | 0.9836 | 0.5798 | 0.1357 | 0.8549 |
+| FD002 | per-condition | 0.0000 | 0.0000 | 0.0000 | 0 | 0.0000 | 0.5455 | 0.1357 | 0.0000 |
+| FD002 | alert-rate | 0.1253 | 0.0810 | 0.2769 | 2,747 | 0.9344 | 0.5798 | 0.1810 | 0.1403 |
+| FD002 | per-condition + alert-rate | 0.0911 | 0.0550 | 0.2649 | 3,026 | 0.8852 | 0.5455 | 0.0361 | 0.1975 |
+| FD003 | zero-shot | 0.4932 | 0.7219 | 0.3746 | 2 | 0.6000 | 0.9458 | 0.1357 | 0.0110 |
+| FD003 | per-condition | 0.2902 | 0.1736 | 0.8832 | 125 | 1.0000 | 0.9464 | 0.1357 | 0.1081 |
+| FD003 | alert-rate | 0.1750 | 0.0960 | 0.9828 | 322 | 1.0000 | 0.9458 | 0.0098 | 0.2174 |
+| FD003 | per-condition + alert-rate | 0.1771 | 0.0974 | 0.9759 | 196 | 1.0000 | 0.9464 | 0.0832 | 0.2130 |
+| FD004 | zero-shot | 0.0514 | 0.0264 | 0.9074 | 3,365 | 1.0000 | 0.5983 | 0.1357 | 0.8705 |
+| FD004 | per-condition | 0.0000 | 0.0000 | 0.0000 | 0 | 0.0000 | 0.5777 | 0.1357 | 0.0000 |
+| FD004 | alert-rate | 0.1023 | 0.0609 | 0.3183 | 3,438 | 0.9810 | 0.5983 | 0.1812 | 0.1324 |
+| FD004 | per-condition + alert-rate | 0.0626 | 0.0352 | 0.2789 | 3,863 | 0.8681 | 0.5777 | 0.0361 | 0.2007 |
 
 Source FD001 validation reference: F1 `0.8297`, precision `0.7507`, recall `0.9274`, ROC-AUC `0.9835`, average precision `0.9305`, Brier `0.0410`, ECE `0.0239`.
 
-The result is deliberately reported as a failure of naive transfer, not as a benchmark win. FD002 and FD004 mix six operating conditions; applying an FD001-trained scaler, model and threshold without condition normalisation keeps recall high (`0.89`/`0.91`) but collapses precision (`0.043`/`0.026`) and generates thousands of false-alarm episodes, while ROC-AUC and average precision fall close to chance. FD003 (two conditions) degrades mostly through recall (`0.37`) with acceptable precision (`0.72`). This is exactly the operational question the cross-condition report is meant to expose: a single-condition threshold is not deployable across conditions without per-condition normalisation or condition-aware calibration.
+The result is a **negative result for simple label-free adaptation**, and is reported as such:
+
+- Per-condition scaling alone sends every FD002/FD004 score below the source threshold (zero alerts) and slightly worsens ranking (ROC-AUC `0.580 -> 0.546` and `0.598 -> 0.578`); it is not a fix.
+- Alert-rate matching improves F1 on FD002 (`0.082 -> 0.125`) and FD004 (`0.051 -> 0.102`) only by cutting recall from about `0.90` to `0.28-0.32`; thousands of false-alarm episodes remain.
+- On FD003, matching the source's `21%` alert rate is actively harmful: the target's zero-shot alert rate is `1.1%`, and the matched threshold creates 322 false-alarm episodes (F1 `0.493 -> 0.175`).
+- Combining both corrections is worse than threshold matching alone on FD002/FD004. There is no universal operating point across conditions.
+
+The ranking itself is near chance on FD002/FD004 (ROC-AUC around `0.55-0.60`, average precision `0.03-0.06`). The next step is therefore not another threshold rule but a condition-aware representation (health index, condition-specific model or a small labelled target calibration set), evaluated with the same ablation.
 
 ### Symbolic contribution
 
@@ -620,11 +654,12 @@ $env:Path = "C:\Program Files\swipl\bin;$env:Path"
 python -m unittest discover -s tests -q
 ```
 
-Expected result: `241 tests ... OK`. The symbolic tests are skipped when SWI-Prolog/PySWIP is unavailable; the FD001 threshold, provenance and classifier tests, plus the README metric check, are skipped when the parquet or run artifacts are missing.
+Expected result: `249 tests ... OK`. The symbolic tests are skipped when SWI-Prolog/PySWIP is unavailable; the FD001 threshold, provenance and classifier tests, plus the README metric check, are skipped when the parquet or run artifacts are missing.
 
 ## Limitations
 
 - FD001 is the reference dataset and the only one with published results. FD002-FD004 are supported through overlay configurations and the CLI, but require the corresponding NASA data downloads.
+- Cross-condition adaptation is label-free but transductive: it uses unlabelled target test features and scores. It does not constitute zero-shot deployment, and the measured per-condition scaling / alert-rate matching did not solve the transfer.
 - The label is binary (`RUL <= 30`); no multi-horizon or survival formulation is implemented.
 - The official test set is highly imbalanced; accuracy is not a sufficient metric.
 - Calibration is a post-hoc sigmoid/isotonic wrapper around RandomForest/MLP/LightGBM, not a sequence model trained with a probabilistic loss.

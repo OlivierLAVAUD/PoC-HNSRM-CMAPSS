@@ -242,6 +242,17 @@ class TestConfigValidation(unittest.TestCase):
                 config, self.logger, '/tmp/project', '/tmp/project/configs'
             )
 
+        config = self._minimal_config()
+        config['experiments'] = {
+            'cross_condition': {
+                'adaptation': {'normalization': 'magic'},
+            }
+        }
+        with self.assertRaises(ValueError):
+            validate_config(
+                config, self.logger, '/tmp/project', '/tmp/project/configs'
+            )
+
     def test_accepts_new_extension_sections(self):
         config = self._minimal_config()
         config['experiments'] = {
