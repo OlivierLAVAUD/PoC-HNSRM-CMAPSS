@@ -189,6 +189,17 @@ python main.py --threshold-sensitivity
 # Price false negatives against false alarms and pick an alert mode
 python main.py --operational-policy
 
+# Multi-subset C-MAPSS benchmark (FD001 remains the default)
+python main.py --cmapss-dataset fd002
+python main.py --cmapss-dataset fd003
+python main.py --cmapss-dataset fd004
+
+# Cross-condition generalisation: train on FD001, report on other subsets
+python main.py --cross-condition --cross-test-datasets fd002,fd004
+
+# Consolidate every robustness artifact into one dossier
+python main.py --robustness-report
+
 # Verify the audit trail of the last run
 python -m src.utils.audit --results results
 
@@ -200,7 +211,9 @@ make lint
 make test
 ```
 
-The new analyses are also configurable: `experiments.multi_seed`, `threshold_sensitivity`, `operational_policy`, `fusion.nested_validation` and `rul_regression.uncertainty` are disabled by default and enabled by their flag (or with `enabled: true`), while `alerting.hysteresis`, `monitoring.drift`, `audit` and `fusion.validation` are enabled in `configs/config.yaml` and run with every normal pipeline run.
+The new analyses are also configurable: `experiments.multi_seed`, `experiments.cross_condition`, `threshold_sensitivity`, `operational_policy`, `fusion.nested_validation` and `rul_regression.uncertainty` are disabled by default and enabled by their flag (or with `enabled: true`), while `alerting.hysteresis`, `alerting.policy_comparison`, `monitoring.drift`, `audit` and `fusion.validation` are enabled in `configs/config.yaml` and run with every normal pipeline run.
+
+FD002-FD004 use base-plus-overlay configuration: `configs/config_fd002.yaml`, `config_fd003.yaml` and `config_fd004.yaml` declare `extends: config.yaml` and override only the dataset identity, sensor/window shape, RUL threshold, data paths and results directory. A missing download produces a setup message naming the expected `data/raw/CMAPSS/FD00X_processed.parquet`, `test_FD00X.txt` and `RUL_FD00X.txt` files instead of a loader stack trace. Sensor names, sensor count, input shape and dataset paths are validated before training.
 
 The pipeline writes the run summary, metrics, calibration/threshold reports, alerting analysis, HITL queue and architecture-specific artifacts. Key files:
 
@@ -212,6 +225,11 @@ The pipeline writes the run summary, metrics, calibration/threshold reports, ale
 - `results/temporal_feature_metadata.json`
 - `results/engine_metrics_validation.csv` and `results/engine_metrics_test.csv`
 - `results/episode_metrics_validation.csv` and `results/episode_metrics_test.csv`
+- `results/alert_policy_comparison.json` and `.csv` (episode-level alert-policy comparison)
+- `results/symbolic_contribution.json` (diagnostic signal- and rule-level ablation)
+- `results/cross_condition_report.json` and `results/cross_condition_summary.csv` (after `--cross-condition`)
+- `results/robustness_report.json`, `.csv`, `.md` and `results/visualization/robustness_report.png` (after `--robustness-report`)
+- `results/fd002/`, `results/fd003/`, `results/fd004/` (per-subset runs)
 - `results/fusion_nested_validation.json` (when `fusion.nested_validation.enabled` is true)
 - `results/temporal_thresholds.json`
 - `results/hitl_rule_validation.json`
@@ -324,6 +342,27 @@ Most FD001 test trajectories never enter the `RUL <= 30` failure zone, hence the
 
 Consecutive confirmation removes isolated alerts at a small recall cost. Requiring three consecutive alerts gives the best precision in this run.
 
+### Alert policy comparison
+
+`alerting.policy_comparison` is enabled on every run and writes `results/alert_policy_comparison.json` and `.csv`. Every mode is described by the same decision unit: a degradation episode is a maximal run of consecutive `RUL <= 30` windows for one engine, an alert episode is a maximal run of consecutive predicted alerts, and an alert episode is a false alarm when it overlaps no real episode. Mode selection uses validation episode cost only; the official test split is reported for information.
+
+The table below was regenerated from the default FD001 run (`python main.py`, RandomForest, no fusion) on 2026-11-06. It is the artifact-backed record for `results/alert_policy_comparison.{json,csv}`; regenerate it whenever that run changes. The validation-selected threshold is `0.1357` and the derived hysteresis thresholds are enter `0.1857` / exit `0.0857`.
+
+| Mode | Split | Real ep. | Detected | Ep. recall | Ep. precision | False-alarm ep. | Window FP | Mean anticipation | Mean alert→end | Episode cost |
+|---|---|---:|---:|---:|---:|---:|---:|---:|---:|---:|
+| immediate | validation | 20 | 20 | 1.0000 | 0.7857 | 6 | 191 | 27.90 | 27.90 | 6 |
+| consecutive_2 | validation | 20 | 20 | 1.0000 | 0.8696 | 3 | 188 | 27.65 | 27.65 | 3 |
+| consecutive_3 | validation | 20 | 20 | 1.0000 | 0.9091 | 2 | 186 | 27.65 | 27.65 | 2 |
+| smoothed_3 | validation | 20 | 20 | 1.0000 | 1.0000 | 0 | 188 | 27.45 | 27.45 | **0** |
+| hysteresis | validation | 20 | 20 | 1.0000 | 1.0000 | 0 | 175 | 27.30 | 27.30 | **0** |
+| immediate | official test | 25 | 19 | 0.7600 | 0.6897 | 9 | 135 | 28.47 | 12.68 | 69 |
+| consecutive_2 | official test | 25 | 19 | 0.7600 | 0.8000 | 5 | 131 | 28.47 | 12.68 | 65 |
+| consecutive_3 | official test | 25 | 19 | 0.7600 | 0.8636 | 3 | 127 | 28.32 | 12.53 | 63 |
+| smoothed_3 | official test | 25 | 19 | 0.7600 | 0.8261 | 4 | 131 | 28.16 | 12.37 | 64 |
+| hysteresis | official test | 25 | 19 | 0.7600 | 0.9048 | 2 | 138 | 28.05 | 12.26 | 62 |
+
+With `false_negative_cost: 10` and `false_alarm_cost: 1`, validation selects `smoothed_3` (episode cost `0`, tied with `hysteresis`; the first mode in evaluation order wins the tie). On test, `hysteresis` has the lowest episode cost (`62`) and the best episode precision (`0.9048`), but it is **not** selected from test: the test rows only inform the operational review. All five modes detect the same 19/25 test episodes, so smoothing changes false-alarm episodes and precision rather than recall.
+
 ### Multi-seed validation
 
 `python main.py --multi-seed --seeds 42,43,44,45,46` re-splits the 40 training engines five times (20 train / 20 validation per seed) while the official test split stays byte-identical across seeds (fingerprint `aac8a6c7…` in `results/multi_seed_report.json`). Aggregate over the five seeds:
@@ -375,6 +414,71 @@ The ProbLog model keeps a dedicated pressure/flow pathway (high static pressure,
 
 The degraded window is a useful HITL example: its neural probability sits on the validation-selected fusion threshold (`0.2196`) while ProbLog also reports an active degradation pattern.
 
+### Cross-condition generalisation
+
+FD001 has one operating condition, while FD002-FD004 mix several. `python main.py --cross-condition --cross-train-dataset fd001 --cross-test-datasets fd002,fd004` trains, calibrates and thresholds the source dataset on its own training/validation engines, then applies the frozen transforms, model and threshold to each target dataset's official test engines. Target engines are never used to fit, calibrate, select a threshold or adjust the fusion; their labels only compute reporting metrics.
+
+The report is written to `results/cross_condition_report.json` and `results/cross_condition_summary.csv`. Each target row contains F1, precision, recall, ROC-AUC, average precision, Brier score, ECE, engine recall/precision, episode recall/precision, false-alarm episodes, mean anticipation, and the relative degradation of F1/recall/precision/average precision against the source intra-condition *validation* metrics. The same protocol can be enabled in configuration with:
+
+```yaml
+experiments:
+  cross_condition:
+    enabled: true
+    train_conditions: ["fd001"]
+    test_conditions: ["fd002", "fd004"]
+```
+
+The table below is a real run of the protocol above: RandomForest trained on FD001 engines, validation-selected threshold `0.1357`, symbolic layer disabled (no SWI-Prolog in the execution environment), applied unchanged to the official test engines of FD002-FD004. Artifacts: `results/cross_condition_report.json` and `results/cross_condition_summary.csv`.
+
+| Target | Windows | Engines | F1 | Precision | Recall | ROC-AUC | Avg. precision | Brier | ECE | Episode recall | Episode precision | False-alarm ep. | ΔF1 vs FD001 val |
+|---|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|
+| FD002 | 26,505 | 253 | 0.0819 | 0.0429 | 0.8942 | 0.5798 | 0.0573 | 0.0541 | 0.1215 | 0.9836 | 0.0477 | 2,836 | +0.9013 (degradation) |
+| FD003 | 13,696 | 100 | 0.4932 | 0.7219 | 0.3746 | 0.9458 | 0.4423 | 0.0157 | 0.0036 | 0.6000 | 0.9048 | 2 | +0.4056 (degradation) |
+| FD004 | 34,081 | 237 | 0.0514 | 0.0264 | 0.9074 | 0.5983 | 0.0419 | 0.0439 | 0.1381 | 1.0000 | 0.0319 | 3,365 | +0.9381 (degradation) |
+
+Source FD001 validation reference: F1 `0.8297`, precision `0.7507`, recall `0.9274`, ROC-AUC `0.9835`, average precision `0.9305`, Brier `0.0410`, ECE `0.0239`.
+
+The result is deliberately reported as a failure of naive transfer, not as a benchmark win. FD002 and FD004 mix six operating conditions; applying an FD001-trained scaler, model and threshold without condition normalisation keeps recall high (`0.89`/`0.91`) but collapses precision (`0.043`/`0.026`) and generates thousands of false-alarm episodes, while ROC-AUC and average precision fall close to chance. FD003 (two conditions) degrades mostly through recall (`0.37`) with acceptable precision (`0.72`). This is exactly the operational question the cross-condition report is meant to expose: a single-condition threshold is not deployable across conditions without per-condition normalisation or condition-aware calibration.
+
+### Symbolic contribution
+
+`results/symbolic_contribution.json` is a **diagnostic** report: it re-scores the validation and test windows with the production fusion coefficients and threshold unchanged while zeroing symbolic inputs. It never refits the fusion and never changes a decision.
+
+- Signal level: remove `symbolic_rule_score` and/or `problog_failure_risk` and report the delta in window F1, recall, precision, episode recall, false-alarm episodes and expected cost.
+- Rule level: when the symbolic layer is available, remove one rule at a time only on the windows where it fires. Each rule reports activation frequency, validation precision/recall, marginal F1 and episode-recall contribution, conflict rate with the neural probability, and a verdict (`helps`, `hurts`, `neutral`, `never_fired`). The summary lists the most useful rules and the rules to remove or examine.
+
+This makes the Prolog/ProbLog layer auditable as a decision component rather than only as an explanation. A rule that is frequently active but degrades validation F1, or that mostly disagrees with the neural probability, is flagged for review.
+
+## Robustness report
+
+`python main.py --robustness-report` builds a consolidated, post-hoc dossier from the artifacts already present in `results/`. It never retrains a model and never uses the official test split to choose anything.
+
+```bash
+python main.py --multi-seed --seeds 42,43,44,45,46
+python main.py --threshold-sensitivity
+python main.py --operational-policy
+python main.py --robustness-report
+```
+
+Artifacts:
+
+- `results/robustness_report.json`: the full dossier (checks, sources, metrics and rationale).
+- `results/robustness_report.csv`: one row per check (`check`, `status`, `value`, `detail`).
+- `results/robustness_report.md`: a compact human-readable version.
+- `results/visualization/robustness_report.png`: pass/warn/fail/skip counts.
+
+How to interpret stability:
+
+- `pass` checks the presence and coherence of an analysis, not a performance target. `skip` means the underlying artifact was not generated (for example no `--multi-seed` run).
+- `seed_stability` is `pass` when the official-test F1 standard deviation across seeds is at most `0.05`; a `warn` means the result is split-sensitive and the selected threshold/model should not be frozen without review.
+- `multi_seed_leakage` must stay `pass`: training and validation engines are disjoint and the official test engines are byte-identical across seeds.
+- `calibration` warns when test ECE exceeds `0.10`; recalibrate on newly labelled data before trusting probabilities.
+- `drift` is judged on deployment traffic, not on the offline test run: FD001 test trajectories run to failure, so a non-`ok` level there is expected.
+- `alert_policy` reports the validation-selected mode and its episode-level rationale.
+- `rul_uncertainty` is `skip` when `rul_regression.uncertainty.enabled` is false; when enabled, the ensemble summary is aggregated with the other checks.
+
+Operational decisions supported by the dossier: whether the current threshold is stable enough to freeze, whether the fusion and its symbolic inputs add measurable value, which alert mode balances missed episodes against false alarms, and whether HITL review is ordered by risk rather than arrival order.
+
 ## Human-in-the-loop
 
 The queue is built from test windows with:
@@ -384,6 +488,14 @@ The queue is built from test windows with:
 - low neural probability with an active HPC rule (rule/probability conflict).
 
 The queue API also supports a ProbLog-risk conflict reason.
+
+Review order is configurable under `hitl.prioritization` and never changes the decision or the learned-rule validation:
+
+- `strategy: "uncertainty"` keeps the historical neural/ProbLog/rule-conflict risk ordering;
+- `strategy: "expected_cost"` ranks cases by the cost exposure of leaving them unreviewed (`failure probability × RUL imminence × drift factor × false_negative_cost`, net of the inspection cost);
+- `strategy: "hybrid"` blends the uncertainty risk score and the expected-cost score.
+
+`enabled: false` restores the legacy reason-first order. Each exported case carries `hitl_priority`, `priority_score`, `priority_reason`, `expected_cost` and `inspection_cost` in `results/hitl_queue.csv` and `results/hitl_queue.json`; queued windows also carry `hitl_priority` and `hitl_priority_reason` in `results/decision_audit.jsonl`.
 
 Current LightGBM + fusion run: **200 queued cases** from 777 evaluated candidates (`273` eligible).
 
@@ -417,14 +529,18 @@ This section states the defaults supported by the current FD001 results, and wha
 
 ```text
 configs/
-  config.yaml
-data/raw/CMAPSS/                  # downloaded FD001 files (ignored by git)
+  config.yaml                     # FD001 base configuration
+  config_fd002.yaml               # FD002 overlay (extends config.yaml)
+  config_fd003.yaml               # FD003 overlay
+  config_fd004.yaml               # FD004 overlay
+data/raw/CMAPSS/                  # downloaded C-MAPSS files (ignored by git)
 main.py
 src/
   ansrdt/
     core.py                       # perception -> symbols -> state
   data/
-    cmapss_loader.py              # FD001 parquet/txt loader and windowing
+    cmapss_loader.py              # C-MAPSS parquet/txt loader and windowing
+    cmapss_datasets.py            # FD001-FD004 specs, sensor/path validation
     loader_factory.py             # picks the C-MAPSS loader for parquet/txt input
   evaluation/
     calibration.py                # Brier score, ECE, reliability curves
@@ -432,16 +548,20 @@ src/
     engine_metrics.py             # per-engine recall, false alarms, lead time
     episode_metrics.py            # degradation/alert episodes per engine
     alerting.py                   # confirmation, smoothing, hysteresis
+    alert_policy_comparison.py    # consolidated episode-level policy report
     operational_policy.py         # alert modes priced by maintenance cost
+    robustness_report.py          # consolidated robustness dossier
   experiments/
     multi_seed.py                 # per-seed protocol, aggregates, CSV, plot
     threshold_sensitivity.py      # threshold grid, CSV/JSON, plot
+    cross_condition.py            # source-trained, target-reporting evaluation
   features/
     temporal_features.py          # explicit temporal statistics for LightGBM
   fusion/
     probability_fusion.py         # validation-only logistic fusion
     diagnostics.py                # grouped CV, stability, ablation
     nested_validation.py          # engine-grouped nested validation report
+    symbolic_contribution.py       # diagnostic signal/rule ablation
   hitl/
     queue.py                      # uncertain/conflict queue, CSV/JSON export
     feedback.py                   # labels, learned rules, JSONL log, CLI
@@ -471,7 +591,7 @@ legacy/
   synthetic_data_loader.py        # .npz synthetic loader (not FD001)
   adaptive_controller.py          # synthetic-only control loop (not FD001)
   data/                           # synthetic .npz sample used by the legacy path
-tests/                            # 198 unit and integration tests
+tests/                            # unit and integration tests
 results/                          # generated artifacts (ignored by git)
 ```
 
@@ -500,11 +620,12 @@ $env:Path = "C:\Program Files\swipl\bin;$env:Path"
 python -m unittest discover -s tests -q
 ```
 
-Expected result: `198 tests ... OK` (18 skipped without SWI-Prolog). The FD001 threshold, provenance and classifier tests, plus the README metric check, are skipped when the parquet or run artifacts are missing; the symbolic tests are skipped when SWI-Prolog is not available.
+Expected result: `241 tests ... OK`. The symbolic tests are skipped when SWI-Prolog/PySWIP is unavailable; the FD001 threshold, provenance and classifier tests, plus the README metric check, are skipped when the parquet or run artifacts are missing.
 
 ## Limitations
 
-- FD001 only, with a binary `RUL <= 30` label.
+- FD001 is the reference dataset and the only one with published results. FD002-FD004 are supported through overlay configurations and the CLI, but require the corresponding NASA data downloads.
+- The label is binary (`RUL <= 30`); no multi-horizon or survival formulation is implemented.
 - The official test set is highly imbalanced; accuracy is not a sufficient metric.
 - Calibration is a post-hoc sigmoid/isotonic wrapper around RandomForest/MLP/LightGBM, not a sequence model trained with a probabilistic loss.
 - LightGBM uses engineered window statistics and a flattened window, not a learned sequence encoder.

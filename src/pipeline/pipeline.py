@@ -7,7 +7,7 @@ import logging
 import os
 import time
 from datetime import datetime
-from typing import TYPE_CHECKING, Any, Dict, Optional
+from typing import TYPE_CHECKING, Any, Dict, List, Optional
 
 import numpy as np
 from sklearn.metrics import (
@@ -20,11 +20,20 @@ from sklearn.metrics import (
     roc_auc_score,
 )
 
+from src.data.cmapss_datasets import (
+    missing_data_message,
+    validate_dataset_config,
+)
 from src.data.cmapss_loader import CMAPSSLoader
 from src.data.loader_factory import create_data_loader
 from src.data.data_processing import map_labels
 from src.evaluation.calibration import calibration_metrics, save_reliability_plot
 from src.evaluation.alerting import compare_alerting
+from src.evaluation.alert_policy_comparison import (
+    build_alert_policy_comparison,
+    export_alert_policy_comparison_csv,
+    save_alert_policy_comparison,
+)
 from src.evaluation.engine_metrics import (
     compute_engine_metrics,
     export_engine_metrics_csv,
@@ -34,6 +43,8 @@ from src.evaluation.episode_metrics import (
     export_episode_metrics_csv,
 )
 from src.evaluation.operational_policy import (
+    SELECTION_METRICS,
+    SELECTION_UNITS,
     alert_predictions,
     build_operational_policy_report,
     save_operational_policy,
@@ -51,7 +62,15 @@ from src.fusion.probability_fusion import (
     evaluate_probability_fusion,
     symbolic_rule_score,
 )
-from src.hitl.queue import HITLQueue, REASON_PRIORITY
+from src.fusion.symbolic_contribution import (
+    save_symbolic_contribution,
+    symbolic_contribution,
+)
+from src.hitl.queue import (
+    HITLQueue,
+    PRIORITIZATION_STRATEGIES,
+    REASON_PRIORITY,
+)
 from src.models.light_classifier import LightClassifier
 from src.models.rul_regressor import (
     RULEnsembleRegressor,
@@ -93,6 +112,20 @@ class NumpyEncoder(json.JSONEncoder):
         if isinstance(obj, datetime):
             return obj.isoformat()
         return super().default(obj)
+
+
+def _dataset_label(config: dict) -> str:
+    """Return the human-readable dataset label for reports."""
+    dataset = config.get('dataset', {}) or {}
+    label = dataset.get('name') or dataset.get('id')
+    if label:
+        text = str(label)
+        return text if text.startswith('NASA') else f"NASA C-MAPSS {text}"
+    data_file = str(config.get('paths', {}).get('data_file', ''))
+    for token in ('FD001', 'FD002', 'FD003', 'FD004'):
+        if token in data_file:
+            return f"NASA C-MAPSS {token}"
+    return 'NASA C-MAPSS'
 
 
 def _is_number(value: Any) -> bool:
@@ -333,6 +366,80 @@ def _validate_model_and_training(config: dict) -> None:
                 "the official test split cannot drive model selection."
             )
 
+    cross_condition = config.get('experiments', {}).get(
+        'cross_condition', {}
+    )
+    if cross_condition:
+        train_conditions = cross_condition.get('train_conditions') or []
+        test_conditions = cross_condition.get('test_conditions') or []
+        for key, values in (
+                ('train_conditions', train_conditions),
+                ('test_conditions', test_conditions)):
+            if not isinstance(values, list) or not all(
+                    isinstance(name, str) for name in values):
+                raise ValueError(
+                    f"experiments.cross_condition.{key} must be a list of "
+                    "dataset names."
+                )
+            invalid = [
+                name for name in values
+                if str(name).lower() not in {'fd001', 'fd002', 'fd003', 'fd004'}
+            ]
+            if invalid:
+                raise ValueError(
+                    f"experiments.cross_condition.{key} has unsupported "
+                    f"dataset(s): {invalid}."
+                )
+        if cross_condition.get('enabled', False):
+            if len(train_conditions) != 1:
+                raise ValueError(
+                    "experiments.cross_condition.train_conditions must "
+                    "contain exactly one source dataset when enabled."
+                )
+            if not test_conditions:
+                raise ValueError(
+                    "experiments.cross_condition.test_conditions must list "
+                    "at least one target dataset when enabled."
+                )
+            overlap = set(
+                str(name).lower() for name in train_conditions
+            ) & set(str(name).lower() for name in test_conditions)
+            if overlap:
+                raise ValueError(
+                    "Cross-condition train and test conditions must be "
+                    f"disjoint, got overlap: {sorted(overlap)}."
+                )
+
+    prioritization = config.get('hitl', {}).get('prioritization', {})
+    if prioritization:
+        if prioritization.get('strategy', 'uncertainty') not in (
+                PRIORITIZATION_STRATEGIES):
+            raise ValueError(
+                "hitl.prioritization.strategy must be one of "
+                f"{PRIORITIZATION_STRATEGIES}."
+            )
+        for key, default in (
+                ('false_negative_cost', 10.0), ('false_alarm_cost', 1.0)):
+            _require_range(
+                prioritization.get(key, default),
+                f'hitl.prioritization.{key}', 0.0, 1e9,
+            )
+        if (float(prioritization.get('false_negative_cost', 10.0)) == 0.0
+                and float(prioritization.get('false_alarm_cost', 1.0)) == 0.0):
+            raise ValueError(
+                "hitl.prioritization costs cannot both be zero."
+            )
+        if (not isinstance(prioritization.get('max_cases', 200), int)
+                or prioritization.get('max_cases', 200) < 1):
+            raise ValueError(
+                "hitl.prioritization.max_cases must be an integer >= 1."
+            )
+        _require_range(
+            prioritization.get('rul_threshold', 30.0),
+            'hitl.prioritization.rul_threshold', 0.0, 1e6,
+            allow_low=False,
+        )
+
     multi_seed = config.get('experiments', {}).get('multi_seed', {})
     if multi_seed:
         seeds = multi_seed.get('seeds', [42])
@@ -409,6 +516,49 @@ def _validate_model_and_training(config: dict) -> None:
                 "immediate, consecutive_2, consecutive_3, smoothed_3, "
                 "smoothed_5."
             )
+        if policy.get('selection_unit', 'window') not in SELECTION_UNITS:
+            raise ValueError(
+                "operational_policy.selection_unit must be one of "
+                f"{SELECTION_UNITS}."
+            )
+
+    comparison = config.get('alerting', {}).get('policy_comparison', {})
+    if comparison.get('enabled', False):
+        for key in ('false_negative_cost', 'false_alarm_cost'):
+            _require_range(
+                comparison.get(key, 10.0 if key == 'false_negative_cost' else 1.0),
+                f'alerting.policy_comparison.{key}', 0.0, 1e9,
+            )
+        if (float(comparison.get('false_negative_cost', 10.0)) == 0.0
+                and float(comparison.get('false_alarm_cost', 1.0)) == 0.0):
+            raise ValueError(
+                "alerting.policy_comparison costs cannot both be zero."
+            )
+        if comparison.get('cost_unit', 'episode') not in SELECTION_UNITS:
+            raise ValueError(
+                "alerting.policy_comparison.cost_unit must be one of "
+                f"{SELECTION_UNITS}."
+            )
+        if comparison.get('selection_metric', 'expected_cost') not in (
+                SELECTION_METRICS):
+            raise ValueError(
+                "alerting.policy_comparison.selection_metric must be one of "
+                f"{SELECTION_METRICS}."
+            )
+        capacity = comparison.get('inspection_capacity_per_cycle')
+        if capacity is not None:
+            _require_range(
+                capacity,
+                'alerting.policy_comparison.inspection_capacity_per_cycle',
+                0.0, 1e9,
+            )
+        hysteresis = comparison.get('hysteresis') or {}
+        if 'margin' in hysteresis:
+            _require_range(
+                hysteresis['margin'],
+                'alerting.policy_comparison.hysteresis.margin',
+                0.0, 1.0, allow_low=False,
+            )
 
     fusion_validation = config.get('fusion', {}).get('validation', {})
     if fusion_validation:
@@ -481,6 +631,20 @@ def validate_config(config: dict, logger: logging.Logger, project_root: str, con
                 logger.error(f"Missing required configuration key: {key}")
                 raise KeyError(f"Missing required configuration key: {key}")
 
+        data_file = str(config.get('paths', {}).get('data_file', '')).lower()
+        if data_file.endswith(('.parquet', '.txt')):
+            dataset_report = validate_dataset_config(config)
+            for warning in dataset_report['warnings']:
+                logger.warning(warning)
+            logger.info(
+                "C-MAPSS dataset %s: %d sensors, window %d, %d operating "
+                "condition(s).",
+                dataset_report['dataset'].upper(),
+                dataset_report['sensor_count'],
+                dataset_report['window_size'],
+                dataset_report['operating_conditions'],
+            )
+
         _validate_model_and_training(config)
 
         required_paths_info = {
@@ -517,6 +681,16 @@ def validate_config(config: dict, logger: logging.Logger, project_root: str, con
             elif not os.path.exists(full_path):
                 if path_info.get('optional', False):
                     logger.warning(f"Optional file '{key}' not found at: {full_path}")
+                elif key in ('data_file', 'test_file', 'rul_file'):
+                    missing = [
+                        name for name in ('data_file', 'test_file', 'rul_file')
+                        if not os.path.exists(str(
+                            config['paths'].get(name) or ''
+                        ))
+                    ]
+                    message = missing_data_message(config, missing)
+                    logger.error(message)
+                    raise FileNotFoundError(message)
                 else:
                     raise FileNotFoundError(f"Required file '{key}' not found at: {full_path}")
 
@@ -544,6 +718,7 @@ class ANSRDTPipeline:
         self.feature_names = self.config['model'].get('feature_names', [])
         if not self.feature_names:
             raise ValueError("feature_names missing in model configuration.")
+        self.dataset_name = _dataset_label(self.config)
 
         self.data_loader = create_data_loader(
             self.config['paths']['data_file'],
@@ -875,9 +1050,16 @@ class ANSRDTPipeline:
         return explanations
 
     def _build_hitl_queue(self, X_raw: np.ndarray, scores: np.ndarray,
-                          decision_threshold: Optional[float] = None
+                          decision_threshold: Optional[float] = None,
+                          predicted_rul: Optional[np.ndarray] = None,
+                          rul_uncertainty: Optional[np.ndarray] = None,
+                          drift_level: Optional[str] = None
                           ) -> Dict[str, Any]:
-        """Queue uncertain and rule/probability-conflicting test windows."""
+        """Queue uncertain and rule/probability-conflicting test windows.
+
+        The configured prioritization strategy only changes review order; the
+        decision, the threshold and the learned-rule validation are untouched.
+        """
         hitl_config = self.config.get('hitl', {})
         if not hitl_config.get('enabled', True) or len(X_raw) == 0:
             return {}
@@ -897,6 +1079,34 @@ class ANSRDTPipeline:
         max_cases = int(hitl_config.get('max_cases', 200))
         sample_per_bucket = max(1, int(hitl_config.get('sample_per_bucket', 300)))
         random_state = int(self.config['training'].get('random_state', 42))
+        prioritization = hitl_config.get('prioritization', {}) or {}
+        prioritization_enabled = bool(prioritization.get('enabled', False))
+        prioritization_strategy = str(
+            prioritization.get('strategy', 'uncertainty')
+        ).lower()
+        false_negative_cost = float(
+            prioritization.get('false_negative_cost', 10.0)
+        )
+        false_alarm_cost = float(
+            prioritization.get('false_alarm_cost', 1.0)
+        )
+        rul_threshold = float(
+            prioritization.get('rul_threshold',
+                               self.config['training'].get('rul_threshold', 30))
+        )
+        max_cases = int(
+            prioritization.get('max_cases', max_cases)
+        )
+        risk_weights = {
+            key: float(value) for key, value in (
+                prioritization.get('risk_weights', {}) or {}
+            ).items()
+        }
+        risk_thresholds = {
+            key: float(value) for key, value in (
+                prioritization.get('risk_thresholds', {}) or {}
+            ).items()
+        }
 
         scores = np.asarray(scores, dtype=float)
         low_mask = scores < uncertain_low
@@ -963,18 +1173,56 @@ class ANSRDTPipeline:
                 )
             if reason is None:
                 continue
+            case_rul = (
+                float(predicted_rul[index])
+                if predicted_rul is not None and len(predicted_rul) == len(scores)
+                else None
+            )
+            case_uncertainty = (
+                float(rul_uncertainty[index])
+                if rul_uncertainty is not None
+                and len(rul_uncertainty) == len(scores)
+                else None
+            )
+            priority = HITLQueue.evaluate_priority(
+                score, problog_risk or 0.0, reason, case_rul,
+                case_uncertainty, drift_level, prioritization_strategy,
+                risk_weights, risk_thresholds or None,
+                false_negative_cost, false_alarm_cost, rul_threshold,
+            )
             records.append({
                 'priority': REASON_PRIORITY.get(reason, 99),
+                'priority_value': float(priority['priority_score']),
+                'risk_score': float(priority['risk_score']),
                 'window_index': index,
                 'neural_probability': score,
                 'problog_failure_risk': problog_risk,
+                'predicted_rul': case_rul,
+                'rul_uncertainty': case_uncertainty,
                 'reason': reason,
                 'insights': insights,
                 'sensor_values': sensor_dict,
                 'active_learned_rules': active_learned_rules,
             })
 
-        records.sort(key=lambda item: (item['priority'], item['window_index']))
+        if prioritization_enabled and prioritization_strategy != 'uncertainty':
+            records.sort(
+                key=lambda item: (
+                    -item['priority_value'], item['priority'],
+                    item['window_index'],
+                )
+            )
+        elif prioritization_enabled:
+            records.sort(
+                key=lambda item: (
+                    -item['risk_score'], item['priority'],
+                    item['window_index'],
+                )
+            )
+        else:
+            records.sort(
+                key=lambda item: (item['priority'], item['window_index'])
+            )
 
         results_dir = self.config['paths']['results_dir']
         queue = HITLQueue(
@@ -983,6 +1231,12 @@ class ANSRDTPipeline:
             output_dir=results_dir,
             max_cases=max_cases,
             decision_threshold=decision_threshold,
+            prioritization_enabled=prioritization_enabled,
+            risk_thresholds=risk_thresholds or None,
+            strategy=prioritization_strategy,
+            false_negative_cost=false_negative_cost,
+            false_alarm_cost=false_alarm_cost,
+            rul_threshold=rul_threshold,
         )
         unit_ids = getattr(self.data_loader, 'unit_ids', None)
         end_cycles = getattr(self.data_loader, 'window_end_cycles', None)
@@ -1017,6 +1271,10 @@ class ANSRDTPipeline:
                     sensor_values=record['sensor_values'],
                     unit=metadata(unit_ids, index),
                     cycle=metadata(end_cycles, index),
+                    risk_weights=risk_weights or None,
+                    predicted_rul=record.get('predicted_rul'),
+                    rul_uncertainty=record.get('rul_uncertainty'),
+                    drift_level=drift_level,
                 )
         finally:
             problog_logger.setLevel(previous_problog_level)
@@ -1475,6 +1733,102 @@ class ANSRDTPipeline:
         report['report_path'] = path
         return report
 
+    def _alert_policy_comparison(self, splits: Dict[str, Any],
+                                 val_scores: np.ndarray,
+                                 test_scores: np.ndarray,
+                                 threshold: float,
+                                 suffix: str = '') -> Dict[str, Any]:
+        """Compare alert policies with window, engine and episode metrics."""
+        comparison_config = self.config.get('alerting', {}).get(
+            'policy_comparison', {}
+        )
+        if not comparison_config.get('enabled', False):
+            return {}
+        report = build_alert_policy_comparison(
+            splits['y_val'], val_scores, splits['val_units'],
+            splits['val_cycles'], splits['val_rul'],
+            splits['y_test'], test_scores, splits['test_units'],
+            splits['test_cycles'], splits['test_rul'],
+            threshold, comparison_config,
+        )
+        results_dir = self.config['paths']['results_dir']
+        json_path = save_alert_policy_comparison(
+            report, os.path.join(
+                results_dir, f'alert_policy_comparison{suffix}.json'
+            ),
+        )
+        csv_path = export_alert_policy_comparison_csv(
+            report, os.path.join(
+                results_dir, f'alert_policy_comparison{suffix}.csv'
+            ),
+        )
+        self.logger.info(
+            "Alert policy comparison selected %s on validation "
+            "(%s cost).", report['selected_mode'], report['cost_unit'],
+        )
+        return {
+            **report, 'json_path': json_path, 'csv_path': csv_path,
+        }
+
+    def transform_external_windows(self, prepared: Dict[str, Any],
+                                   X_raw: np.ndarray) -> np.ndarray:
+        """Apply the source-fitted transforms to external target windows."""
+        data = np.asarray(X_raw, dtype=np.float32)
+        architecture = prepared['architecture']
+        if prepared.get('uses_temporal_features') and prepared['extractor']:
+            transformed = prepared['extractor'].transform(data)
+        elif architecture == 'lightgbm':
+            transformed = np.asarray(data).reshape(len(data), -1)
+        elif prepared.get('scaler') is not None:
+            transformed = self._split_scaled(prepared['scaler'], data)
+        else:
+            transformed = data
+        if (prepared.get('uses_rul_feature')
+                and prepared.get('rul_regressor') is not None):
+            predicted_rul = prepared['rul_regressor'].predict(transformed)
+            transformed = np.hstack([
+                transformed, np.asarray(predicted_rul).reshape(-1, 1)
+            ]).astype(np.float32)
+        return transformed
+
+    def evaluate_external_windows(
+            self, prepared: Dict[str, Any], X_raw: np.ndarray,
+            y_true: np.ndarray, units: np.ndarray, cycles: np.ndarray,
+            rul: np.ndarray, threshold: float) -> Dict[str, Any]:
+        """Score and describe external target windows without retraining.
+
+        The threshold and every transform come from the source run. Target
+        labels are used only to report metrics, never to fit or select.
+        """
+        X_model = self.transform_external_windows(prepared, X_raw)
+        scores = self.model.positive_proba(X_model)
+        predictions = (scores >= float(threshold)).astype(int)
+        metrics = self._compute_metrics(y_true, predictions, scores)
+        calibration = calibration_metrics(
+            y_true, scores,
+            n_bins=int(self.config.get('calibration', {}).get('n_bins', 10)),
+        )
+        engine = compute_engine_metrics(
+            units, cycles, rul, y_true, predictions
+        )
+        episode = compute_episode_metrics(
+            y_true, predictions, units, cycles, rul
+        )
+        return {
+            'metrics': metrics,
+            'calibration': {
+                'brier_score': float(calibration['brier_score']),
+                'ece': float(calibration['ece']),
+            },
+            'engine_metrics': engine['summary'],
+            'episode_metrics': {
+                key: value for key, value in episode.items()
+                if key != 'episodes'
+            },
+            'scores': scores,
+            'predictions': predictions,
+        }
+
     def _evaluate_architecture(self, prepared: Dict[str, Any],
                                splits: Dict[str, Any],
                                suffix: str = '') -> Dict[str, Any]:
@@ -1637,6 +1991,7 @@ class ANSRDTPipeline:
             problog_program = file.read()
         symbolic_scores = np.zeros(len(X_raw), dtype=float)
         problog_risks = np.zeros(len(X_raw), dtype=float)
+        insight_rows: List[List[str]] = []
         problog_config = self.config.get('problog', {})
         problog_logger = logging.getLogger('problog')
         previous_problog_level = problog_logger.level
@@ -1649,6 +2004,7 @@ class ANSRDTPipeline:
                 }
                 reasoner.state_history = []
                 insights = reasoner.reason(sensor_dict, window=window)
+                insight_rows.append(list(insights))
                 symbolic_scores[index] = symbolic_rule_score(insights)
                 problog = evaluate_state(
                     problog_program, sensor_dict,
@@ -1671,6 +2027,14 @@ class ANSRDTPipeline:
             problog_logger.setLevel(previous_problog_level)
         if predicted_rul is None:
             predicted_rul = np.zeros(len(X_raw), dtype=float)
+        names = sorted({name for row in insight_rows for name in row})
+        activations = np.zeros((len(X_raw), len(names)), dtype=bool)
+        for row_index, row in enumerate(insight_rows):
+            for name in row:
+                activations[row_index, names.index(name)] = True
+        if not hasattr(self, '_rule_activation_cache'):
+            self._rule_activation_cache = {}
+        self._rule_activation_cache[label] = (names, activations)
         return ProbabilityFusion.build_matrix(
             neural_scores, symbolic_scores, problog_risks,
             predicted_rul, feature_order=feature_order,
@@ -1745,6 +2109,32 @@ class ANSRDTPipeline:
         )
         with open(threshold_path, 'w') as file:
             json.dump(fusion_selection, file, indent=2, cls=NumpyEncoder)
+        rule_cache = getattr(self, '_rule_activation_cache', {}) or {}
+        rule_names, rule_val = rule_cache.get(
+            'validation', ([], np.zeros((len(val_matrix), 0), dtype=bool))
+        )
+        _, rule_test = rule_cache.get(
+            'test', ([], np.zeros((len(test_matrix), 0), dtype=bool))
+        )
+        contribution_report = symbolic_contribution(
+            fusion_model, val_matrix, splits['y_val'],
+            splits['val_units'], splits['val_cycles'], splits['val_rul'],
+            test_matrix, splits['y_test'], splits['test_units'],
+            splits['test_cycles'], splits['test_rul'], fusion_threshold,
+            self.config.get('operational_policy', {}),
+            rule_names=rule_names,
+            rule_activations_val=rule_val,
+            rule_activations_test=rule_test,
+            neural_val=neural_val_scores,
+            neural_test=neural_test_scores,
+            neural_threshold=neural_threshold,
+        )
+        results_dir = self.config['paths']['results_dir']
+        contribution_path = save_symbolic_contribution(
+            contribution_report,
+            os.path.join(results_dir, 'symbolic_contribution.json'),
+        )
+        contribution_report['report_path'] = contribution_path
         report = {
             'enabled': True,
             'applied': True,
@@ -1784,6 +2174,7 @@ class ANSRDTPipeline:
             'test_scores': test_fused,
             'val_matrix': val_matrix,
             'test_matrix': test_matrix,
+            'symbolic_contribution': contribution_report,
         }
         self.logger.info(
             "Fusion validation metrics: %s", report['validation_metrics']
@@ -1837,6 +2228,39 @@ class ANSRDTPipeline:
         )
         trail.max_records = None if max_records <= 0 else max_records
         include_insights = int(audit_config.get('include_insights', 25) or 0)
+        prioritization = self.config.get('hitl', {}).get(
+            'prioritization', {}
+        ) or {}
+        prioritization_strategy = str(
+            prioritization.get('strategy', 'uncertainty')
+        ).lower()
+        prioritization_enabled = bool(
+            prioritization.get('enabled', False)
+        )
+        priority_costs = {
+            'false_negative_cost': float(
+                prioritization.get('false_negative_cost', 10.0)
+            ),
+            'false_alarm_cost': float(
+                prioritization.get('false_alarm_cost', 1.0)
+            ),
+            'rul_threshold': float(
+                prioritization.get(
+                    'rul_threshold',
+                    self.config['training'].get('rul_threshold', 30),
+                )
+            ),
+        }
+        risk_weights = {
+            key: float(value) for key, value in (
+                prioritization.get('risk_weights', {}) or {}
+            ).items()
+        }
+        risk_thresholds = {
+            key: float(value) for key, value in (
+                prioritization.get('risk_thresholds', {}) or {}
+            ).items()
+        }
 
         scores = np.asarray(test_scores, dtype=float).ravel()
         predictions = alert_predictions(
@@ -1932,6 +2356,18 @@ class ANSRDTPipeline:
             if (rul_uncertainty is None and rul_uncertainties is not None
                     and len(rul_uncertainties) == len(scores)):
                 rul_uncertainty = float(rul_uncertainties[position])
+            audit_priority = HITLQueue.evaluate_priority(
+                neural_scores[position], problog_risk or 0.0, '',
+                predicted_rul, rul_uncertainty, drift_level,
+                prioritization_strategy if prioritization_enabled
+                else 'uncertainty',
+                risk_weights, risk_thresholds or None,
+                priority_costs['false_negative_cost'],
+                priority_costs['false_alarm_cost'],
+                priority_costs['rul_threshold'],
+            )
+            hitl_priority = str(audit_priority['priority'])
+            priority_reason = str(audit_priority['priority_reason'])
             trail.add(
                 split='test',
                 window_index=position,
@@ -1959,6 +2395,8 @@ class ANSRDTPipeline:
                     'drift_level': drift_level,
                     'drift_score': drift_score,
                 },
+                hitl_priority=hitl_priority,
+                hitl_priority_reason=priority_reason,
             )
 
         if kg is not None:
@@ -2334,16 +2772,27 @@ class ANSRDTPipeline:
                 splits['y_test'], final_test_pred, suffix='_test',
             ),
         }
-
+        alert_policy = self._alert_policy_comparison(
+            splits, val_scores, test_scores, decision_threshold,
+            suffix='_fusion' if fusion.get('applied') else '',
+        )
         explanations = self._explain_representative_windows(
             splits['X_test'], test_scores, decision_threshold
         )
-        hitl_queue = self._build_hitl_queue(
-            splits['X_test'], test_scores, decision_threshold
-        )
+
         analyses = self._run_decision_analyses(
             splits, evaluation, val_scores, test_scores,
             decision_threshold, fusion,
+        )
+        hitl_queue = self._build_hitl_queue(
+            splits['X_test'], test_scores, decision_threshold,
+            predicted_rul=evaluation.get('rul_regression', {}).get(
+                'test_predictions'
+            ),
+            rul_uncertainty=evaluation.get('rul_regression', {}).get(
+                'test_uncertainty'
+            ),
+            drift_level=(analyses.get('drift') or {}).get('level'),
         )
         if fusion.get('applied'):
             decision_section = {
@@ -2379,7 +2828,9 @@ class ANSRDTPipeline:
         }
 
         results = {
-            'dataset': 'NASA C-MAPSS FD001',
+            'dataset': getattr(
+                self, 'dataset_name', _dataset_label(self.config)
+            ),
             'architecture': prepared['architecture'],
             'test_source': splits['test_source'],
             'data_file': self.config['paths']['data_file'],
@@ -2403,6 +2854,7 @@ class ANSRDTPipeline:
             'probability_fusion': fusion_report,
             'rul_regression': rul_report,
             'alerting': alerting,
+            'alert_policy_comparison': alert_policy,
             'calibration': {
                 **calibration_info,
                 'metrics': calibration_report,
@@ -2442,6 +2894,8 @@ class ANSRDTPipeline:
                 'decision_threshold_path': primary_threshold_path,
                 'temporal_thresholds_path': temporal_path,
                 'alerting_report_path': alerting.get('report_path'),
+                'alert_policy_comparison_path': alert_policy.get('json_path'),
+                'alert_policy_comparison_csv_path': alert_policy.get('csv_path'),
                 'hitl_rule_validation_path': rule_validation_path,
                 'hitl_queue_csv': hitl_queue.get('csv_path'),
                 'hitl_queue_json': hitl_queue.get('json_path'),
@@ -2457,6 +2911,9 @@ class ANSRDTPipeline:
                 'fusion_ablation_path': analyses[
                     'fusion_diagnostics'
                 ].get('ablation_path'),
+                'symbolic_contribution_path': fusion.get(
+                    'symbolic_contribution', {}
+                ).get('report_path'),
                 'fusion_nested_validation_path': analyses[
                     'fusion_nested_validation'
                 ].get('path'),
@@ -2564,7 +3021,9 @@ class ANSRDTPipeline:
             key=lambda name: comparison[name]['validation_selection_score'],
         )
         report = {
-            'dataset': 'NASA C-MAPSS FD001',
+            'dataset': getattr(
+                self, 'dataset_name', _dataset_label(self.config)
+            ),
             'selection_metric': compare_config.get(
                 'selection_metric', 'fbeta'
             ),

@@ -22,9 +22,38 @@ def _resolve(base: str, path: str) -> str:
     return path if os.path.isabs(path) else os.path.normpath(os.path.join(base, path))
 
 
+CMAPSS_DATASETS = ('fd001', 'fd002', 'fd003', 'fd004')
+
+
+def _config_path_for_dataset(project_root: str, dataset: str) -> str:
+    """Return the configuration file for a C-MAPSS sub-dataset."""
+    name = str(dataset or 'fd001').lower()
+    if name not in CMAPSS_DATASETS:
+        raise ValueError(f"Unsupported C-MAPSS dataset: {dataset!r}")
+    filename = 'config.yaml' if name == 'fd001' else f'config_{name}.yaml'
+    return os.path.join(project_root, 'configs', filename)
+
+
+def _parse_datasets(values: str) -> list:
+    """Parse and validate a comma-separated C-MAPSS dataset list."""
+    names = [
+        item.strip().lower() for item in str(values or '').split(',')
+        if item.strip()
+    ]
+    if not names:
+        raise ValueError("At least one C-MAPSS dataset is required.")
+    invalid = [name for name in names if name not in CMAPSS_DATASETS]
+    if invalid:
+        raise ValueError(
+            f"Unsupported C-MAPSS dataset(s): {invalid}. "
+            f"Allowed: {list(CMAPSS_DATASETS)}."
+        )
+    return names
+
+
 def _print_summary(summary: dict) -> None:
     """Print run metrics, model comparison or representative ProbLog risks."""
-    print("\n=== ANSR-DT / C-MAPSS FD001 ===")
+    print(f"\n=== ANSR-DT / {summary.get('dataset', 'C-MAPSS')} ===")
     if 'selected_model' in summary and 'models' in summary:
         print(
             f"Comparison selected: {summary['selected_model']} "
@@ -92,6 +121,22 @@ def _print_summary(summary: dict) -> None:
             )
 
 
+def _print_robustness_summary(report: dict) -> None:
+    """Print the headline of a robustness dossier."""
+    print("\n=== C-MAPSS robustness report ===")
+    print(report.get('summary', ''))
+    for check in report.get('checks', []):
+        print(
+            f"  {check['name']:<28} {check['status']:<5} "
+            f"{check.get('detail', '')}"
+        )
+    artifacts = report.get('artifacts', {})
+    print(f"  report:   {artifacts.get('json_path')}")
+    print(f"  markdown: {artifacts.get('markdown_path')}")
+    print(f"  csv:      {artifacts.get('csv_path')}")
+    print(f"  plot:     {artifacts.get('plot_path')}")
+
+
 def _print_multi_seed_summary(report: dict) -> None:
     """Print the headline of a multi-seed report."""
     aggregate = report.get('aggregate', {})
@@ -141,6 +186,27 @@ def build_parser() -> argparse.ArgumentParser:
                         help='Sweep validation-selected decision thresholds.')
     parser.add_argument('--operational-policy', action='store_true',
                         help='Select the alert mode from maintenance costs.')
+    parser.add_argument('--robustness-report', action='store_true',
+                        help='Build a robustness dossier from existing artifacts.')
+    parser.add_argument(
+        '--cmapss-dataset',
+        choices=list(CMAPSS_DATASETS),
+        default='fd001',
+        help='C-MAPSS sub-dataset configuration (fd001-fd004).',
+    )
+    parser.add_argument(
+        '--cross-condition', action='store_true',
+        help='Train on one C-MAPSS condition and test unchanged on others.',
+    )
+    parser.add_argument(
+        '--cross-train-dataset', choices=list(CMAPSS_DATASETS), default=None,
+        help='Source dataset for --cross-condition (defaults to --cmapss-dataset).',
+    )
+    parser.add_argument(
+        '--cross-test-datasets', default=None,
+        help='Comma-separated target datasets for --cross-condition. '
+             'Defaults to experiments.cross_condition.test_conditions.',
+    )
     parser.add_argument(
         '--benchmark',
         choices=['fd001', 'skab'],
@@ -155,6 +221,9 @@ def main(clear: bool = False, compare_models: bool = False,
          architecture: str = None, multi_seed: bool = False,
          seeds: str = None, threshold_sensitivity: bool = False,
          operational_policy: bool = False, benchmark: str = 'fd001',
+         cmapss_dataset: str = 'fd001', cross_condition: bool = False,
+         robustness_report: bool = False,
+         cross_train_dataset: str = None, cross_test_datasets: str = None,
          modes=None, data_path: str = None,
          model_type: str = 'random_forest', epochs: int = 50,
          symbolic: bool = True, min_support: int = 3,
@@ -175,8 +244,26 @@ def main(clear: bool = False, compare_models: bool = False,
     logger = setup_logging(log_file=log_path, log_level=logging.INFO)
     logger.info("--- Starting ANSR-DT run (%s) ---", datetime.now())
 
-    config_path = os.path.join(PROJECT_ROOT, 'configs', 'config.yaml')
+    source_dataset = (cross_train_dataset or cmapss_dataset or 'fd001').lower()
+    config_path = _config_path_for_dataset(PROJECT_ROOT, source_dataset)
     config = load_config(config_path)
+    cross_settings = (
+        config.get('experiments', {}) or {}
+    ).get('cross_condition', {}) or {}
+    if cross_settings.get('enabled', False):
+        cross_condition = True
+    if cross_condition and not cross_train_dataset:
+        train_conditions = [
+            str(name).strip().lower()
+            for name in cross_settings.get('train_conditions') or []
+            if str(name).strip()
+        ]
+        if train_conditions and train_conditions[0] != source_dataset:
+            source_dataset = train_conditions[0]
+            config_path = _config_path_for_dataset(
+                PROJECT_ROOT, source_dataset
+            )
+            config = load_config(config_path)
     if architecture:
         config.setdefault('model', {})['architecture'] = architecture
         logger.info("Architecture overridden from CLI: %s", architecture)
@@ -191,6 +278,59 @@ def main(clear: bool = False, compare_models: bool = False,
     if clear:
         logger.warning("Clearing results directory: %s", results_dir)
         clear_results(results_dir)
+
+    if robustness_report:
+        from src.evaluation.robustness_report import run_robustness_report
+
+        report = run_robustness_report(results_dir)
+        _print_robustness_summary(report)
+        logger.info("--- ANSR-DT robustness report finished ---")
+        return 0
+
+    if cross_condition:
+        from src.experiments.cross_condition import run_cross_condition
+
+        configured_targets = [
+            str(name).strip().lower()
+            for name in cross_settings.get('test_conditions') or []
+            if str(name).strip()
+        ]
+        target_names = _parse_datasets(
+            cross_test_datasets
+            or (','.join(configured_targets) if configured_targets
+                else 'fd002,fd004')
+        )
+        if source_dataset in target_names:
+            raise ValueError(
+                "The cross-condition source dataset cannot also be a target."
+            )
+        targets = []
+        for name in target_names:
+            target_path = _config_path_for_dataset(PROJECT_ROOT, name)
+            targets.append({
+                'name': name.upper(),
+                'config': load_config(target_path),
+                'config_path': target_path,
+            })
+        report = run_cross_condition(
+            config, config_path, targets, logger,
+            results_dir=results_dir, architecture=architecture,
+        )
+        print("\n=== C-MAPSS cross-condition ===")
+        print(
+            f"source={report['protocol']['source_dataset']} "
+            f"targets={report['protocol']['target_datasets']} "
+            f"threshold={report['protocol']['threshold']:.4f}"
+        )
+        for row in report['rows']:
+            print(
+                f"  {row['target_dataset']:<6} f1={float(row['f1'] or 0):.4f} "
+                f"recall={float(row['recall'] or 0):.4f} "
+                f"precision={float(row['precision'] or 0):.4f}"
+            )
+        print(f"  report: {report['artifacts']['report_path']}")
+        logger.info("--- ANSR-DT cross-condition run finished ---")
+        return 0
 
     if seeds or multi_seed:
         logger.info("Multi-seed mode enabled.")
@@ -240,6 +380,11 @@ if __name__ == '__main__':
         threshold_sensitivity=args.threshold_sensitivity,
         operational_policy=args.operational_policy,
         benchmark=args.benchmark,
+        cmapss_dataset=args.cmapss_dataset,
+        cross_condition=args.cross_condition,
+        cross_train_dataset=args.cross_train_dataset,
+        cross_test_datasets=args.cross_test_datasets,
+        robustness_report=args.robustness_report,
         modes=args.modes,
         data_path=args.data_path,
         model_type=args.model_type,

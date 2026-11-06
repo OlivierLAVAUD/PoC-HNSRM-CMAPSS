@@ -149,7 +149,10 @@ class AuditTrail:
             insights: Optional[Iterable[str]] = None,
             active_rules: Optional[Iterable[str]] = None,
             data_quality: Optional[Dict[str, Any]] = None,
-            alert_confirmed: Optional[bool] = None) -> Optional[Dict[str, Any]]:
+            alert_confirmed: Optional[bool] = None,
+            hitl_priority: Optional[str] = None,
+            hitl_priority_reason: Optional[str] = None
+            ) -> Optional[Dict[str, Any]]:
         """Append one decision record, honouring ``max_records``."""
         if not self.enabled:
             return None
@@ -211,6 +214,13 @@ class AuditTrail:
             'active_rules': list(active_rules or []),
             'insights': list(insights or []),
             'data_quality': dict(data_quality or {}),
+            'hitl_priority': (
+                None if hitl_priority is None else str(hitl_priority)
+            ),
+            'hitl_priority_reason': (
+                None if hitl_priority_reason is None
+                else str(hitl_priority_reason)
+            ),
         }
         self.records.append(record)
         return record

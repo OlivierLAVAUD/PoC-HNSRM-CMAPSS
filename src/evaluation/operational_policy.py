@@ -29,6 +29,7 @@ import numpy as np
 
 from src.evaluation.alerting import consecutive_confirmation, smoothed_predictions
 from src.evaluation.engine_metrics import compute_engine_metrics
+from src.evaluation.episode_metrics import compute_episode_metrics
 
 ALERT_MODES: tuple = (
     'immediate',
@@ -39,15 +40,26 @@ ALERT_MODES: tuple = (
 )
 
 SELECTION_METRICS: tuple = ('expected_cost', 'fbeta', 'recall', 'f1', 'precision')
+SELECTION_UNITS: tuple = ('window', 'engine', 'episode')
 
 CSV_FIELDS: List[str] = [
-    'mode', 'split', 'threshold', 'true_positives', 'false_positives',
-    'false_negatives', 'true_negatives', 'recall', 'precision', 'f1', 'f2',
-    'total_false_alarms', 'missed_critical_windows', 'mean_anticipation_cycles',
-    'mean_lead_time_cycles', 'proportion_alerted_before_eol',
-    'false_alarms_per_cycle', 'expected_cost', 'capacity_feasible',
-    'selected',
+    'mode', 'split', 'selection_unit', 'threshold', 'true_positives',
+    'false_positives', 'false_negatives', 'true_negatives', 'recall',
+    'precision', 'f1', 'f2', 'episode_recall', 'episode_precision',
+    'real_episodes', 'detected_episodes', 'alert_episodes',
+    'false_alarm_episodes', 'total_false_alarms', 'missed_critical_windows',
+    'mean_anticipation_cycles', 'mean_lead_time_cycles',
+    'episode_mean_anticipation_cycles',
+    'episode_mean_alert_to_end_cycles',
+    'proportion_alerted_before_eol', 'false_alarms_per_cycle',
+    'expected_cost', 'expected_cost_window', 'expected_cost_engine',
+    'expected_cost_episode', 'capacity_feasible', 'selected',
 ]
+
+
+def _optional_ratio(value: Any) -> float:
+    """Return a metric or 0.0 when the denominator was empty."""
+    return 0.0 if value is None else float(value)
 
 
 def _safe_div(numerator: float, denominator: float) -> float:
@@ -158,15 +170,37 @@ def evaluate_alert_mode(y_true: np.ndarray, scores: np.ndarray,
                         rul: np.ndarray, threshold: float, mode: str,
                         false_negative_cost: float = 1.0,
                         false_alarm_cost: float = 0.0,
-                        inspection_capacity_per_cycle: Optional[float] = None
+                        inspection_capacity_per_cycle: Optional[float] = None,
+                        selection_unit: str = 'window',
+                        predictions_override: Optional[np.ndarray] = None
                         ) -> Dict[str, Any]:
-    """Describe one alert mode on one split."""
+    """Describe one alert mode on one split.
+
+    Window, engine and episode views are all reported. ``expected_cost`` is the
+    cost of the configured selection unit; the three unit-specific costs remain
+    available for auditability.
+    """
+    selection_unit = str(selection_unit).lower()
+    if selection_unit not in SELECTION_UNITS:
+        raise ValueError(
+            f"Unsupported operational selection unit: {selection_unit!r}"
+        )
     y_true = np.asarray(y_true, dtype=int).ravel()
-    predictions = alert_predictions(scores, unit_ids, cycles, threshold, mode)
+    predictions = (
+        np.asarray(predictions_override, dtype=int).ravel()
+        if predictions_override is not None
+        else alert_predictions(scores, unit_ids, cycles, threshold, mode)
+    )
+    if len(predictions) != len(y_true):
+        raise ValueError("predictions_override must match y_true length.")
     window = window_metrics(y_true, predictions)
-    engine = compute_engine_metrics(
+    engine_report = compute_engine_metrics(
         unit_ids, cycles, rul, y_true, predictions
-    )['summary']
+    )
+    engine = engine_report['summary']
+    episode = compute_episode_metrics(
+        y_true, predictions, unit_ids, cycles, rul
+    )
     cycles_observed = len(np.unique(np.column_stack([
         np.asarray(unit_ids).ravel(), np.asarray(cycles).ravel()
     ]), axis=0)) if len(y_true) else 0
@@ -175,6 +209,46 @@ def evaluate_alert_mode(y_true: np.ndarray, scores: np.ndarray,
         None if inspection_capacity_per_cycle is None
         else float(inspection_capacity_per_cycle)
     )
+
+    relevant_engines = [
+        row for row in engine_report['per_engine']
+        if row['positive_windows'] > 0
+    ]
+    missed_engines = sum(
+        1 for row in relevant_engines
+        if row['first_correct_alert_cycle'] is None
+    )
+    false_alarm_engines = sum(
+        1 for row in engine_report['per_engine']
+        if row['predicted_positives'] > 0 and row['true_positives'] == 0
+    )
+    missed_episodes = max(
+        0, int(episode['real_episodes']) - int(episode['detected_episodes'])
+    )
+    false_alarm_episodes = int(episode['false_alarm_episodes'])
+
+    cost_units = {
+        'window': {
+            'false_negatives': int(window['false_negatives']),
+            'false_alarms': int(window['false_positives']),
+        },
+        'engine': {
+            'false_negatives': int(missed_engines),
+            'false_alarms': int(false_alarm_engines),
+        },
+        'episode': {
+            'false_negatives': int(missed_episodes),
+            'false_alarms': int(false_alarm_episodes),
+        },
+    }
+    expected_costs = {
+        unit: expected_cost(
+            counts['false_negatives'], counts['false_alarms'],
+            false_negative_cost, false_alarm_cost,
+        )
+        for unit, counts in cost_units.items()
+    }
+
     return {
         'mode': str(mode),
         'threshold': float(threshold),
@@ -194,33 +268,73 @@ def evaluate_alert_mode(y_true: np.ndarray, scores: np.ndarray,
         'proportion_alerted_before_eol_among_relevant': float(
             engine['proportion_alerted_before_eol_among_relevant']
         ),
+        'episode_recall': _optional_ratio(episode['episode_recall']),
+        'episode_precision': _optional_ratio(episode['episode_precision']),
+        'real_episodes': int(episode['real_episodes']),
+        'detected_episodes': int(episode['detected_episodes']),
+        'alert_episodes': int(episode['alert_episodes']),
+        'false_alarm_episodes': false_alarm_episodes,
+        'episode_mean_anticipation_cycles': (
+            episode['mean_anticipation_cycles']
+        ),
+        'episode_mean_alert_to_end_cycles': (
+            episode['mean_alert_to_episode_end_cycles']
+        ),
+        'missed_engines': int(missed_engines),
+        'false_alarm_engines': int(false_alarm_engines),
         'false_alarms_per_cycle': false_alarms_per_cycle,
         'inspection_capacity_per_cycle': capacity,
         'capacity_feasible': (
             True if capacity is None else bool(false_alarms_per_cycle <= capacity)
         ),
         'cycles_observed': int(cycles_observed),
-        'expected_cost': expected_cost(
-            window['false_negatives'], window['false_positives'],
-            false_negative_cost, false_alarm_cost,
+        'selection_unit': selection_unit,
+        'cost_by_unit': cost_units,
+        'expected_cost_window': expected_costs['window'],
+        'expected_cost_engine': expected_costs['engine'],
+        'expected_cost_episode': expected_costs['episode'],
+        'expected_cost': expected_costs[selection_unit],
+    }
+
+
+def _metric_values(mode_report: Dict[str, Any],
+                   selection_unit: str) -> Dict[str, float]:
+    """Return recall/precision/F1 for the configured decision unit."""
+    if selection_unit == 'engine':
+        precision = float(mode_report['mean_precision'])
+        recall = float(mode_report['mean_recall'])
+    elif selection_unit == 'episode':
+        precision = float(mode_report['episode_precision'])
+        recall = float(mode_report['episode_recall'])
+    else:
+        precision = float(mode_report['precision'])
+        recall = float(mode_report['recall'])
+    denominator = precision + recall
+    return {
+        'precision': precision,
+        'recall': recall,
+        'f1': (
+            2.0 * precision * recall / denominator
+            if denominator else 0.0
         ),
     }
 
 
 def _selection_key(mode_report: Dict[str, Any], metric: str,
-                   beta: float) -> float:
+                   beta: float, selection_unit: str = 'window') -> float:
     """Return the validation score used to rank alert modes."""
+    values = _metric_values(mode_report, selection_unit)
     if metric == 'expected_cost':
         return -float(mode_report['expected_cost'])
     if metric == 'recall':
-        return float(mode_report['mean_recall'])
+        return values['recall']
     if metric == 'f1':
-        return float(mode_report['f1'])
+        return values['f1']
     if metric == 'precision':
-        return float(mode_report['precision'])
+        return values['precision']
     if metric == 'fbeta':
-        precision = float(mode_report['precision'])
-        recall = float(mode_report['recall'])
+        precision = values['precision']
+        recall = values['recall']
         beta_sq = beta * beta
         denominator = beta_sq * precision + recall
         return (
@@ -233,12 +347,19 @@ def _selection_key(mode_report: Dict[str, Any], metric: str,
 def _rationale(selected: str, validation: Dict[str, Dict[str, Any]],
                test: Optional[Dict[str, Dict[str, Any]]],
                false_negative_cost: float, false_alarm_cost: float,
-               metric: str, capacity: Optional[float]) -> Dict[str, Any]:
+               metric: str, capacity: Optional[float],
+               selection_unit: str = 'window') -> Dict[str, Any]:
     """Explain the selection in plain language."""
     chosen = validation[selected]
     immediate = validation.get('immediate', chosen)
-    recall_delta = float(chosen['mean_recall'] - immediate['mean_recall'])
-    precision_delta = float(chosen['precision'] - immediate['precision'])
+    chosen_values = _metric_values(chosen, selection_unit)
+    immediate_values = _metric_values(immediate, selection_unit)
+    recall_delta = float(
+        chosen_values['recall'] - immediate_values['recall']
+    )
+    precision_delta = float(
+        chosen_values['precision'] - immediate_values['precision']
+    )
     lead_delta = float(
         chosen['mean_lead_time_cycles'] - immediate['mean_lead_time_cycles']
     )
@@ -257,9 +378,9 @@ def _rationale(selected: str, validation: Dict[str, Dict[str, Any]],
             f"for immediate alerts"
         ),
         (
-            f"validation recall {chosen['mean_recall']:.4f} "
+            f"validation {selection_unit} recall {chosen_values['recall']:.4f} "
             f"({recall_delta:+.4f} vs immediate) and precision "
-            f"{chosen['precision']:.4f} ({precision_delta:+.4f})"
+            f"{chosen_values['precision']:.4f} ({precision_delta:+.4f})"
         ),
         (
             f"false alarms {chosen['total_false_alarms']} "
@@ -275,14 +396,17 @@ def _rationale(selected: str, validation: Dict[str, Dict[str, Any]],
     return {
         'selected_mode': selected,
         'selection_metric': metric,
+        'selection_unit': selection_unit,
         'expected_cost_validation': float(chosen['expected_cost']),
         'expected_cost_test': (
             None if test is None else float(test[selected]['expected_cost'])
         ),
         'precision_recall_tradeoff': (
-            f"{selected}: recall {chosen['mean_recall']:.4f} vs "
-            f"{immediate['mean_recall']:.4f} for immediate alerts; precision "
-            f"{chosen['precision']:.4f} vs {immediate['precision']:.4f}"
+            f"{selected}: {selection_unit} recall "
+            f"{chosen_values['recall']:.4f} vs "
+            f"{immediate_values['recall']:.4f} for immediate alerts; precision "
+            f"{chosen_values['precision']:.4f} vs "
+            f"{immediate_values['precision']:.4f}"
         ),
         'anticipation_impact': (
             f"mean engine lead time {chosen['mean_lead_time_cycles']:.2f} cycles "
@@ -291,6 +415,11 @@ def _rationale(selected: str, validation: Dict[str, Dict[str, Any]],
             f"{chosen['mean_anticipation_cycles']:.2f} cycles"
         ),
         'reasons': reasons,
+        'episode_impact': (
+            f"{selected} detects {chosen['detected_episodes']}/"
+            f"{chosen['real_episodes']} real episodes with "
+            f"{chosen['false_alarm_episodes']} false-alarm episode(s)"
+        ),
     }
 
 
@@ -314,6 +443,12 @@ def build_operational_policy_report(
             f"operational_policy.selection_metric must be one of "
             f"{SELECTION_METRICS}, got {metric!r}."
         )
+    selection_unit = str(config.get('selection_unit', 'window')).lower()
+    if selection_unit not in SELECTION_UNITS:
+        raise ValueError(
+            f"operational_policy.selection_unit must be one of "
+            f"{SELECTION_UNITS}, got {selection_unit!r}."
+        )
     capacity = config.get('inspection_capacity_per_cycle')
     if capacity is not None:
         capacity = float(capacity)
@@ -333,14 +468,14 @@ def build_operational_policy_report(
     validation = {
         mode: evaluate_alert_mode(
             y_val, val_scores, val_units, val_cycles, val_rul,
-            threshold, mode, fn_cost, fa_cost, capacity,
+            threshold, mode, fn_cost, fa_cost, capacity, selection_unit,
         )
         for mode in modes
     }
     test = {
         mode: evaluate_alert_mode(
             y_test, test_scores, test_units, test_cycles, test_rul,
-            threshold, mode, fn_cost, fa_cost, capacity,
+            threshold, mode, fn_cost, fa_cost, capacity, selection_unit,
         )
         for mode in modes
     }
@@ -360,9 +495,11 @@ def build_operational_policy_report(
     else:
         selected = max(
             candidates,
-            key=lambda mode: _selection_key(validation[mode], metric, beta),
+            key=lambda mode: _selection_key(
+                validation[mode], metric, beta, selection_unit
+            ),
         )
-        selection_reason = f'best_validation_{metric}'
+        selection_reason = f'best_validation_{metric}_{selection_unit}'
 
     for mode, report in validation.items():
         report['selected'] = mode == selected
@@ -371,7 +508,8 @@ def build_operational_policy_report(
         report['selected'] = mode == selected
 
     rationale = _rationale(
-        selected, validation, test, fn_cost, fa_cost, metric, capacity
+        selected, validation, test, fn_cost, fa_cost, metric, capacity,
+        selection_unit,
     )
     return {
         'selection_split': 'validation',
@@ -381,6 +519,7 @@ def build_operational_policy_report(
         'false_alarm_cost': fa_cost,
         'inspection_capacity_per_cycle': capacity,
         'selection_metric': metric,
+        'selection_unit': selection_unit,
         'capacity_feasible_modes': feasible,
         'selected_mode': selected,
         'selection_reason': selection_reason,
@@ -411,5 +550,8 @@ def export_operational_policy_csv(report: Dict[str, Any], path: str) -> str:
         writer.writeheader()
         for split in ('validation', 'test'):
             for mode, values in report.get(split, {}).items():
-                writer.writerow({**values, 'split': split})
+                writer.writerow({
+                    **values, 'split': split,
+                    'selection_unit': report.get('selection_unit', 'window'),
+                })
     return path

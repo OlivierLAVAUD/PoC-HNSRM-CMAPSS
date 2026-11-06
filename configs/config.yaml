@@ -1,5 +1,11 @@
 # configs/config.yaml
 
+# Dataset identity used in reports.
+dataset:
+  id: "FD001"
+  name: "NASA C-MAPSS FD001"
+  operating_conditions: 1
+
 # ===============================
 # Model Configuration
 # ===============================
@@ -107,6 +113,27 @@ hitl:
   uncertain_high: 0.6
   max_cases: 200
   sample_per_bucket: 300
+  # Rank review cases by their combined neural/ProbLog/rule-conflict risk.
+  # The legacy reason-first order is kept when this block is disabled.
+  # Review ordering only: the strategy never changes the decision, the alert
+  # or the learned-rule validation. `uncertainty` keeps the historical
+  # neural/ProbLog/conflict ordering; `expected_cost` ranks by cost exposure;
+  # `hybrid` blends both. Set enabled: false for the legacy reason-first order.
+  prioritization:
+    enabled: true
+    strategy: "uncertainty"     # uncertainty | expected_cost | hybrid
+    false_negative_cost: 10.0
+    false_alarm_cost: 1.0
+    max_cases: 200
+    rul_threshold: 30
+    risk_weights:
+      neural: 1.0
+      problog: 1.0
+      conflict: 1.0
+    risk_thresholds:
+      medium: 0.4
+      high: 0.6
+      critical: 0.8
   rule_validation:
     enabled: true
     min_precision: 0.9
@@ -183,6 +210,14 @@ experiments:
     seeds: [42, 43, 44, 45, 46]
     selection_metric: "fbeta"
     beta: 2.0
+  # Cross-condition generalisation. Disabled by default. When enabled (or via
+  # --cross-condition), the source dataset is trained and thresholded on its
+  # own validation engines and applied unchanged to the target datasets;
+  # target engines are never used to fit, calibrate or select anything.
+  cross_condition:
+    enabled: false
+    train_conditions: []      # e.g. ["fd001"]
+    test_conditions: []       # e.g. ["fd002", "fd004"]
 
 # ===============================
 # Threshold Sensitivity Analysis
@@ -203,7 +238,8 @@ operational_policy:
   false_negative_cost: 10.0
   false_alarm_cost: 1.0
   inspection_capacity_per_cycle: null   # max inspections per engine-cycle
-  selection_metric: "expected_cost"      # expected_cost | fbeta | recall
+  selection_metric: "expected_cost"      # expected_cost | fbeta | recall | f1 | precision
+  selection_unit: "window"               # window | engine | episode
   preferred_alert_mode: null             # immediate | consecutive_2 | ...
 
 # ===============================
@@ -221,6 +257,17 @@ alerting:
     enter_threshold: null
     exit_threshold: null
     margin: 0.05
+  # Consolidated window/engine/episode comparison of immediate, confirmed,
+  # smoothed and hysteresis policies. Selection remains validation-only.
+  policy_comparison:
+    enabled: true
+    false_negative_cost: 10.0
+    false_alarm_cost: 1.0
+    cost_unit: "episode"                   # window | engine | episode
+    selection_metric: "expected_cost"
+    inspection_capacity_per_cycle: null
+    hysteresis:
+      margin: 0.05
 
 # ===============================
 # Auxiliary RUL Regression

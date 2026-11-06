@@ -189,13 +189,19 @@ src/
 ### Configuration
 
 - `configs/config.yaml` - Main FD001 configuration
+- `configs/config_fd002.yaml`, `config_fd003.yaml`, `config_fd004.yaml` - C-MAPSS overlays that `extends: config.yaml` and override dataset identity, sensor/window shape, RUL threshold, paths and results directory
 - `configs/config_skab_separate.yaml` - SKAB-specific config (8 features)
 
 ### Results
 
 - `results/` - Run-specific subdirectories
+  - `results/alert_policy_comparison.json` / `.csv` - Episode-level alert-policy comparison (validation selection, test reporting only)
+  - `results/symbolic_contribution.json` - Diagnostic signal- and rule-level ablation of the Prolog/ProbLog inputs
+  - `results/cross_condition_report.json` / `cross_condition_summary.csv` - Cross-condition generalisation (after `--cross-condition`)
+  - `results/robustness_report.json` / `.csv` / `.md` and `results/visualization/robustness_report.png` - Consolidated robustness dossier
+  - `results/fd002/`, `results/fd003/`, `results/fd004/` - Per-subset benchmark outputs
   - `results/skab_separate/` - SKAB benchmark outputs
-  - `results/visualization/` - Generated diagrams (8 figures)
+  - `results/visualization/` - Generated diagrams
   - `results/multi_seed/` - Multi-seed validation results
 
 ### Data
@@ -220,8 +226,19 @@ python main.py --multi-seed --seeds 42,43,44,45,46
 # Threshold sensitivity sweep
 python main.py --threshold-sensitivity
 
-# Operational alert policy
+# Operational alert policy (selection unit: window | engine | episode)
 python main.py --operational-policy
+
+# Other C-MAPSS subsets (FD001 remains the default)
+python main.py --cmapss-dataset fd002
+python main.py --cmapss-dataset fd003
+python main.py --cmapss-dataset fd004
+
+# Cross-condition generalisation: fit FD001, report on other subsets unchanged
+python main.py --cross-condition --cross-test-datasets fd002,fd004
+
+# Consolidated robustness dossier from the artifacts in results/
+python main.py --robustness-report
 ```
 
 ### SKAB Benchmark (Native Path)

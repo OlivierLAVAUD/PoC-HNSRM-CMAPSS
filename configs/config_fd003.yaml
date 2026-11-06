@@ -1,0 +1,39 @@
+# configs/config_fd003.yaml
+# FD003 overlay: inherits configs/config.yaml and overrides only what differs.
+# Two operating conditions and two fault modes instead of FD001's one.
+
+extends: config.yaml
+
+dataset:
+  id: "FD003"
+  name: "NASA C-MAPSS FD003"
+  operating_conditions: 2
+
+model:
+  feature_names:
+    - s2
+    - s3
+    - s4
+    - s7
+    - s8
+    - s9
+    - s11
+    - s12
+    - s13
+    - s14
+    - s15
+    - s17
+    - s20
+    - s21
+  input_shape: [30, 14]
+  cnn_lstm:
+    input_shape: [30, 14]
+
+training:
+  rul_threshold: 30
+
+paths:
+  data_file: 'data/raw/CMAPSS/FD003_processed.parquet'
+  test_file: 'data/raw/CMAPSS/test_FD003.txt'
+  rul_file: 'data/raw/CMAPSS/RUL_FD003.txt'
+  results_dir: 'results/fd003'

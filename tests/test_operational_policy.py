@@ -226,3 +226,95 @@ class TestOperationalPolicy(unittest.TestCase):
 
 if __name__ == '__main__':
     unittest.main()
+
+
+class TestOperationalSelectionUnits(unittest.TestCase):
+    def setUp(self):
+        (self.y, self.scores, self.units, self.cycles,
+         self.rul) = build_split()
+
+    def _report(self, selection_unit):
+        return build_operational_policy_report(
+            self.y, self.scores, self.units, self.cycles, self.rul,
+            self.y, self.scores, self.units, self.cycles, self.rul,
+            0.5, {
+                'false_negative_cost': 10.0,
+                'false_alarm_cost': 1.0,
+                'inspection_capacity_per_cycle': None,
+                'selection_metric': 'expected_cost',
+                'selection_unit': selection_unit,
+            },
+        )
+
+    def test_unit_specific_cost_is_used_for_selection(self):
+        for unit in ('window', 'engine', 'episode'):
+            report = self._report(unit)
+            self.assertEqual(report['selection_unit'], unit)
+            selected = report['validation'][report['selected_mode']]
+            self.assertAlmostEqual(
+                selected['expected_cost'],
+                selected[f'expected_cost_{unit}'],
+            )
+            self.assertIn(unit, report['selection_reason'])
+
+    def test_window_selection_is_the_unchanged_default(self):
+        report = build_operational_policy_report(
+            self.y, self.scores, self.units, self.cycles, self.rul,
+            self.y, self.scores, self.units, self.cycles, self.rul,
+            0.5, {
+                'false_negative_cost': 10.0,
+                'false_alarm_cost': 1.0,
+                'inspection_capacity_per_cycle': None,
+                'selection_metric': 'expected_cost',
+            },
+        )
+        self.assertEqual(report['selection_unit'], 'window')
+        selected = report['validation'][report['selected_mode']]
+        self.assertAlmostEqual(
+            selected['expected_cost'], selected['expected_cost_window']
+        )
+
+    def test_invalid_selection_unit_is_rejected(self):
+        with self.assertRaises(ValueError):
+            self._report('component')
+
+    def test_missed_episode_is_priced_as_a_false_negative(self):
+        labels = np.ones(10, dtype=int)
+        scores = np.zeros(10, dtype=float)
+        units = np.array([1] * 5 + [2] * 5)
+        cycles = np.array([1, 2, 3, 4, 5] * 2)
+        report = evaluate_alert_mode(
+            labels, scores, units, cycles, labels, 0.5, 'immediate',
+            10.0, 1.0, None, 'episode',
+        )
+        self.assertEqual(report['detected_episodes'], 0)
+        self.assertEqual(report['episode_recall'], 0.0)
+        self.assertEqual(report['cost_by_unit']['episode']['false_negatives'], 2)
+        self.assertEqual(report['expected_cost_episode'], 20.0)
+
+    def test_false_alert_episode_is_priced_as_a_false_alarm(self):
+        labels = np.zeros(10, dtype=int)
+        scores = np.full(10, 0.9)
+        units = np.array([1] * 5 + [2] * 5)
+        cycles = np.array([1, 2, 3, 4, 5] * 2)
+        report = evaluate_alert_mode(
+            labels, scores, units, cycles, labels, 0.5, 'immediate',
+            10.0, 1.0, None, 'episode',
+        )
+        self.assertEqual(report['false_alarm_episodes'], 2)
+        self.assertEqual(report['cost_by_unit']['episode']['false_alarms'], 2)
+        self.assertEqual(report['expected_cost_episode'], 2.0)
+
+    def test_equal_costs_are_selected_deterministically(self):
+        from src.evaluation.operational_policy import _selection_key
+
+        first = {'expected_cost': 5.0, 'precision': 0.5, 'recall': 0.5,
+                 'mean_precision': 0.5, 'mean_recall': 0.5,
+                 'episode_precision': 0.5, 'episode_recall': 0.5}
+        second = dict(first)
+        self.assertEqual(
+            _selection_key(first, 'expected_cost', 2.0, 'episode'),
+            _selection_key(second, 'expected_cost', 2.0, 'episode'),
+        )
+        report = self._report('episode')
+        self.assertIn(report['selected_mode'], ALERT_MODES)

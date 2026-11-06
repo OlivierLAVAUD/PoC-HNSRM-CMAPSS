@@ -1,0 +1,45 @@
+# configs/config_fd002.yaml
+# FD002 overlay: inherits configs/config.yaml and overrides only what differs.
+# Six operating conditions instead of FD001's single condition.
+
+extends: config.yaml
+
+dataset:
+  id: "FD002"
+  name: "NASA C-MAPSS FD002"
+  operating_conditions: 6
+
+model:
+  # C-MAPSS FD002 keeps the same 14 informative sensors and 30-cycle window.
+  # Each dataset states its sensor list and input shape explicitly so a future
+  # subset-specific sensor selection cannot silently reuse FD001's shape.
+  feature_names:
+    - s2
+    - s3
+    - s4
+    - s7
+    - s8
+    - s9
+    - s11
+    - s12
+    - s13
+    - s14
+    - s15
+    - s17
+    - s20
+    - s21
+  input_shape: [30, 14]
+  cnn_lstm:
+    input_shape: [30, 14]
+
+training:
+  # Positive class: end-of-window RUL <= 30 cycles.
+  rul_threshold: 30
+
+paths:
+  # Convention: data/raw/CMAPSS/FD002_processed.parquet, test_FD002.txt,
+  # RUL_FD002.txt. Missing files raise a readable setup message.
+  data_file: 'data/raw/CMAPSS/FD002_processed.parquet'
+  test_file: 'data/raw/CMAPSS/test_FD002.txt'
+  rul_file: 'data/raw/CMAPSS/RUL_FD002.txt'
+  results_dir: 'results/fd002'
