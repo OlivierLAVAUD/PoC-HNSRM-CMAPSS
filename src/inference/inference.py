@@ -23,6 +23,7 @@ from src.reasoning.prob_query import RULES_PATH as PROB_RULES_PATH, evaluate_sta
 from src.reasoning.reasoning import SymbolicReasoner
 from src.config.config_manager import load_config
 from src.data.cmapss_loader import CMAPSSLoader
+from src.features.physical_representation import PhysicalRepresentation
 from src.monitoring.drift import check_inference_drift
 from legacy.synthetic_data_loader import DataLoader
 
@@ -73,6 +74,32 @@ class InferencePipeline:
         self.logger.info(f"Resolved scaler path: {scaler_path}")
 
         self.model = LightClassifier.load(model_path, logger=logger)
+        self.representation: Optional[PhysicalRepresentation] = None
+        representation_config = self.config.get('representation', {}) or {}
+        representation_targets = {
+            str(name).lower()
+            for name in representation_config.get(
+                'apply_to_architectures', ['random_forest', 'lightgbm']
+            )
+        }
+        if (representation_config.get('enabled', False)
+                and self.model_architecture in representation_targets):
+            representation_path = os.path.join(
+                self.results_dir, 'models', 'physical_representation.joblib'
+            )
+            if not os.path.exists(representation_path):
+                raise FileNotFoundError(
+                    "Representation is enabled but its artifact is missing at "
+                    f"{representation_path}."
+                )
+            self.representation = PhysicalRepresentation.load(
+                representation_path
+            )
+            logger.info(
+                "Loaded physical representation %s (hash=%s).",
+                self.representation.variant,
+                (self.representation.training_hash or '')[:12],
+            )
         self.needs_feature_bundle = bool(
             getattr(self.model, 'uses_temporal_features', False) is True
             or isinstance(
@@ -193,11 +220,37 @@ class InferencePipeline:
             self.logger.error(f"Failed to load and preprocess data: {e}")
             raise
 
-    def _prepare_model_input(self, X_raw: np.ndarray) -> np.ndarray:
+    def _prepare_model_input(self, X_raw: np.ndarray,
+                             units: Optional[np.ndarray] = None,
+                             cycles: Optional[np.ndarray] = None,
+                             op_settings: Optional[np.ndarray] = None
+                             ) -> np.ndarray:
         """Apply the same feature contract used during training."""
+        representation_matrix = None
+        if self.representation is not None:
+            representation_matrix = self.representation.transform(
+                X_raw, units=units, cycles=cycles, op_settings=op_settings
+            )
         if self.needs_feature_bundle:
-            return self.model.prepare_features(X_raw)
+            base = self.model.prepare_base_features(X_raw)
+            if representation_matrix is not None:
+                base = np.hstack([base, representation_matrix]).astype(np.float32)
+            if self.model.rul_regressor is not None and getattr(
+                    self.model, 'uses_rul_feature', False):
+                predicted_rul = self.model.rul_regressor.predict(base)
+                base = np.hstack([
+                    base, np.asarray(predicted_rul).reshape(-1, 1)
+                ]).astype(np.float32)
+            return base
         if self.scaler is not None:
+            if representation_matrix is not None:
+                expected = getattr(self.scaler, 'n_features_in_', None)
+                if expected is not None and representation_matrix.shape[1] != expected:
+                    raise ValueError(
+                        f"Scaler expects {expected} features but the "
+                        f"representation produced {representation_matrix.shape[1]}."
+                    )
+                return self.scaler.transform(representation_matrix)
             flat = X_raw.reshape(-1, X_raw.shape[-1])
             expected = getattr(self.scaler, 'n_features_in_', X_raw.shape[-1])
             if X_raw.shape[-1] != expected:
@@ -206,7 +259,10 @@ class InferencePipeline:
                     f"{X_raw.shape[-1]}."
                 )
             return self.scaler.transform(flat).reshape(X_raw.shape)
-        return X_raw
+        return (
+            representation_matrix if representation_matrix is not None
+            else X_raw
+        )
 
     def _fusion_scores(self, X_raw: np.ndarray,
                        neural_scores: np.ndarray,
@@ -317,7 +373,10 @@ class InferencePipeline:
         """Run inference on a raw C-MAPSS FD001 file without true RUL labels."""
         try:
             X_raw, loader = self.load_cmapss_windows(data_file)
-            X_model = self._prepare_model_input(X_raw)
+            X_model = self._prepare_model_input(
+                X_raw, units=loader.unit_ids, cycles=loader.window_end_cycles,
+                op_settings=getattr(loader, 'window_op_settings', None),
+            )
             insights = self.get_symbolic_insights(X_raw)
             y_scores, y_pred = self.get_predictions(
                 X_model, X_raw=X_raw, insights=insights

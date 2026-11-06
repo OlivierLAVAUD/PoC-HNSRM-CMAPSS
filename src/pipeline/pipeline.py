@@ -28,6 +28,11 @@ from src.data.cmapss_loader import CMAPSSLoader
 from src.data.loader_factory import create_data_loader
 from src.data.data_processing import map_labels
 from src.evaluation.calibration import calibration_metrics, save_reliability_plot
+from src.evaluation.alert_budget import validate_budget_config
+from src.evaluation.cost_sensitivity import (
+    build_cost_sensitivity,
+    save_cost_sensitivity,
+)
 from src.evaluation.alerting import compare_alerting
 from src.evaluation.alert_policy_comparison import (
     build_alert_policy_comparison,
@@ -54,6 +59,7 @@ from src.evaluation.thresholding import (
     select_threshold,
 )
 from src.experiments.threshold_sensitivity import run_threshold_sensitivity
+from src.features.physical_representation import PhysicalRepresentation
 from src.features.temporal_features import TemporalFeatureExtractor
 from src.fusion.diagnostics import run_fusion_diagnostics
 from src.fusion.nested_validation import run_nested_validation
@@ -642,6 +648,138 @@ def _validate_model_and_training(config: dict) -> None:
         if (not isinstance(audit.get('include_insights', 25), int)
                 or audit.get('include_insights', 25) < 0):
             raise ValueError("audit.include_insights must be an integer >= 0.")
+
+    representation = config.get('representation', {})
+    if representation:
+        variant = str(representation.get('variant', 'raw')).lower()
+        if variant not in {
+                'raw', 'deltas', 'early_life_residual',
+                'operating_condition_residual', 'residual_plus_deltas'}:
+            raise ValueError(
+                "representation.variant must be one of raw, deltas, "
+                "early_life_residual, operating_condition_residual, "
+                "residual_plus_deltas."
+            )
+        if representation.get('fallback_policy', 'neutral') not in {
+                'neutral', 'error'}:
+            raise ValueError(
+                "representation.fallback_policy must be 'neutral' or 'error'."
+            )
+        if 'early_life_cycles' in representation:
+            cycles = representation['early_life_cycles']
+            if (not isinstance(cycles, int) or isinstance(cycles, bool)
+                    or cycles < 2):
+                raise ValueError(
+                    "representation.early_life_cycles must be an integer >= 2."
+                )
+        if 'epsilon' in representation:
+            _require_range(
+                representation['epsilon'], 'representation.epsilon',
+                0.0, 1.0, allow_low=False,
+            )
+        apply_to = representation.get('apply_to_architectures')
+        if apply_to is not None and not isinstance(apply_to, list):
+            raise ValueError(
+                "representation.apply_to_architectures must be a list."
+            )
+        n_conditions = representation.get('n_conditions')
+        if n_conditions is not None and (
+                not isinstance(n_conditions, int)
+                or isinstance(n_conditions, bool) or n_conditions < 1):
+            raise ValueError(
+                "representation.n_conditions must be an integer >= 1 or null."
+            )
+
+    alert_budget = config.get('alert_budget', {})
+    if alert_budget.get('enabled', False):
+        validate_budget_config(alert_budget)
+
+    few_shot = config.get('few_shot_target', {})
+    if few_shot.get('enabled', False):
+        target = str(few_shot.get('target_dataset', 'fd003')).lower()
+        if target not in {'fd002', 'fd003', 'fd004'}:
+            raise ValueError(
+                "few_shot_target.target_dataset must be fd002, fd003 or "
+                "fd004."
+            )
+        calibration_fraction = float(
+            few_shot.get('calibration_fraction', 0.5)
+        )
+        validation_fraction = float(
+            few_shot.get('validation_fraction', 0.5)
+        )
+        _require_range(
+            calibration_fraction, 'few_shot_target.calibration_fraction',
+            0.0, 1.0, allow_low=False, allow_high=False,
+        )
+        _require_range(
+            validation_fraction, 'few_shot_target.validation_fraction',
+            0.0, 1.0, allow_low=False, allow_high=False,
+        )
+        if abs(calibration_fraction + validation_fraction - 1.0) > 1e-9:
+            raise ValueError(
+                "few_shot_target.calibration_fraction + validation_fraction "
+                "must equal 1.0."
+            )
+        if few_shot.get('recalibration_method', 'auto') not in {
+                'auto', 'sigmoid', 'isotonic'}:
+            raise ValueError(
+                "few_shot_target.recalibration_method must be auto, sigmoid "
+                "or isotonic."
+            )
+        if few_shot.get('threshold_strategy', 'recall_at_precision') not in {
+                'f1', 'recall_at_precision', 'fbeta'}:
+            raise ValueError(
+                "few_shot_target.threshold_strategy must be f1, "
+                "recall_at_precision or fbeta."
+            )
+        if 'min_precision' in few_shot:
+            _require_range(
+                few_shot['min_precision'], 'few_shot_target.min_precision',
+                0.0, 1.0,
+            )
+        repeats = few_shot.get('selection_repeats', 1)
+        if (isinstance(repeats, bool) or not isinstance(repeats, int)
+                or not 1 <= repeats <= 20):
+            raise ValueError(
+                "few_shot_target.selection_repeats must be an integer "
+                "between 1 and 20."
+            )
+        if few_shot.get('threshold_aggregation', 'median') not in {
+                'median', 'single'}:
+            raise ValueError(
+                "few_shot_target.threshold_aggregation must be 'median' "
+                "or 'single'."
+            )
+        positive_rate = few_shot.get('validation_positive_rate')
+        if positive_rate is not None:
+            if (isinstance(positive_rate, bool)
+                    or not isinstance(positive_rate, (int, float))
+                    or not 0.0 < float(positive_rate) < 1.0):
+                raise ValueError(
+                    "few_shot_target.validation_positive_rate must be "
+                    "strictly between 0 and 1, or null."
+                )
+
+    cost_sensitivity = config.get('cost_sensitivity', {})
+    if cost_sensitivity.get('enabled', False):
+        ratios = cost_sensitivity.get('false_negative_cost_ratios')
+        if (not isinstance(ratios, list) or not ratios
+                or not all(_is_number(value) and value > 0 for value in ratios)):
+            raise ValueError(
+                "cost_sensitivity.false_negative_cost_ratios must be a "
+                "non-empty list of positive numbers."
+            )
+        _require_range(
+            cost_sensitivity.get('false_alarm_cost', 1.0),
+            'cost_sensitivity.false_alarm_cost', 0.0, 1e9,
+            allow_low=False,
+        )
+        if cost_sensitivity.get('selection_split', 'validation') != 'validation':
+            raise ValueError(
+                "cost_sensitivity.selection_split must be 'validation'; the "
+                "official test split cannot select a cost ratio."
+            )
 
     preprocessing = config.get('preprocessing', {})
     if preprocessing.get('non_finite_policy', 'zero') not in {
@@ -1323,6 +1461,7 @@ class ANSRDTPipeline:
     def _load_cmapss_splits(self) -> Dict[str, Any]:
         """Load FD001 windows and split whole engines into train/val/test."""
         X, y = self.data_loader.load_data()
+        train_ops_all = getattr(self.data_loader, 'window_op_settings', None)
         train_units_all = np.asarray(self.data_loader.unit_ids)
         train_cycles_all = np.asarray(self.data_loader.window_end_cycles)
         train_rul_all = np.asarray(self.data_loader.window_rul)
@@ -1349,10 +1488,18 @@ class ANSRDTPipeline:
             val_units = train_units_all[val_mask]
             val_cycles = train_cycles_all[val_mask]
             val_rul = train_rul_all[val_mask]
+            val_ops = (
+                None if train_ops_all is None else train_ops_all[val_mask]
+            )
+            train_mask = self.data_loader.last_split_masks['train']
+            train_ops = (
+                None if train_ops_all is None else train_ops_all[train_mask]
+            )
             X_test, y_test = self.data_loader.load_test_data()
             test_units = np.asarray(self.data_loader.unit_ids)
             test_cycles = np.asarray(self.data_loader.window_end_cycles)
             test_rul = np.asarray(self.data_loader.window_rul)
+            test_ops = getattr(self.data_loader, 'window_op_settings', None)
             test_source = self.config['paths']['test_file']
         else:
             self.logger.warning(
@@ -1373,6 +1520,9 @@ class ANSRDTPipeline:
             test_units = train_units_all[masks['test']]
             test_cycles = train_cycles_all[masks['test']]
             test_rul = train_rul_all[masks['test']]
+            val_ops = None if train_ops_all is None else train_ops_all[masks['val']]
+            test_ops = None if train_ops_all is None else train_ops_all[masks['test']]
+            train_ops = None if train_ops_all is None else train_ops_all[masks['train']]
             test_source = 'held-out units from training trajectories'
 
         X_train = self._sanitize_non_finite(X_train, 'train')
@@ -1392,6 +1542,8 @@ class ANSRDTPipeline:
             'train_units': np.asarray(train_units_all)[train_mask],
             'train_cycles': np.asarray(train_cycles_all)[train_mask],
             'train_rul': np.asarray(train_rul_all)[train_mask],
+            'train_op_settings': train_ops,
+            'val_op_settings': val_ops, 'test_op_settings': test_ops,
             'val_units': val_units, 'test_units': test_units,
             'val_cycles': val_cycles, 'test_cycles': test_cycles,
             'val_rul': val_rul, 'test_rul': test_rul,
@@ -1484,6 +1636,13 @@ class ANSRDTPipeline:
             'rul_regressor': os.path.join(
                 models_dir, f'lightgbm_rul_regressor{suffix}.joblib'
             ),
+            'representation': os.path.join(
+                models_dir, f'physical_representation{suffix}.joblib'
+            ),
+            'representation_metadata': os.path.join(
+                self.config['paths']['results_dir'],
+                f'physical_representation{suffix}.json'
+            ),
         }
 
     def _prepare_model_data(self, splits: Dict[str, Any],
@@ -1504,6 +1663,62 @@ class ANSRDTPipeline:
         X_train = splits['X_train']
         X_val = splits['X_val']
         X_test = splits['X_test']
+        representation_config = dict(
+            self.config.get('representation', {}) or {}
+        )
+        use_representation = (
+            architecture != 'cnn_lstm'
+            and self._applies_to(representation_config, architecture)
+        )
+        representation = None
+        representation_train = representation_val = representation_test = None
+        representation_report = {'enabled': False}
+        if use_representation:
+            if representation_config.get('n_conditions') is None:
+                representation_config['n_conditions'] = int(
+                    (self.config.get('dataset', {}) or {}).get(
+                        'operating_conditions', 1
+                    ) or 1
+                )
+            representation = PhysicalRepresentation.from_config(
+                self.feature_names, representation_config
+            )
+            representation_train = representation.fit_transform(
+                X_train, units=splits['train_units'],
+                cycles=splits['train_cycles'],
+                op_settings=splits.get('train_op_settings'),
+            )
+            representation_val = representation.transform(
+                X_val, units=splits['val_units'],
+                cycles=splits['val_cycles'],
+                op_settings=splits.get('val_op_settings'),
+            )
+            representation_test = representation.transform(
+                X_test, units=splits['test_units'],
+                cycles=splits['test_cycles'],
+                op_settings=splits.get('test_op_settings'),
+            )
+            representation.save(paths['representation'])
+            representation.save_metadata(paths['representation_metadata'])
+            representation_report = {
+                **representation.metadata(),
+                'enabled': True,
+                'applied_to_architecture': architecture,
+                'artifact_path': paths['representation'],
+                'metadata_path': paths['representation_metadata'],
+                'applied_before_scaler': architecture == 'random_forest',
+                'cnn_lstm_note': (
+                    'CNN-LSTM consumes raw 3D windows and does not apply the '
+                    'tabular representation by default.'
+                ),
+            }
+            self.logger.info(
+                "Physical representation %s: %d -> %d features "
+                "(hash=%s).", representation.variant,
+                X_train.shape[-1] * X_train.shape[1],
+                representation_train.shape[1],
+                representation.training_hash[:12],
+            )
         if use_temporal:
             extractor = TemporalFeatureExtractor(
                 self.feature_names,
@@ -1540,13 +1755,32 @@ class ANSRDTPipeline:
                 f'raw__{index}' for index in range(X_train_model.shape[1])
             ]
         else:
-            scaler, X_train_model = preprocess_sequences(X_train)
-            X_val_model = self._split_scaled(scaler, X_val)
-            X_test_model = self._split_scaled(scaler, X_test)
+            scaler, X_train_model = preprocess_sequences(
+                representation_train if use_representation else X_train
+            )
+            if use_representation:
+                X_val_model = scaler.transform(representation_val)
+                X_test_model = scaler.transform(representation_test)
+                feature_names_out = list(representation.feature_names_out)
+            else:
+                X_val_model = self._split_scaled(scaler, X_val)
+                X_test_model = self._split_scaled(scaler, X_test)
             scaler_path = os.path.join(
                 self.config['paths']['results_dir'], 'scaler.pkl'
             )
             save_scaler(scaler, scaler_path, self.logger)
+
+        if use_representation and architecture == 'lightgbm':
+            X_train_model = np.hstack([
+                X_train_model, representation_train
+            ]).astype(np.float32)
+            X_val_model = np.hstack([
+                X_val_model, representation_val
+            ]).astype(np.float32)
+            X_test_model = np.hstack([
+                X_test_model, representation_test
+            ]).astype(np.float32)
+            feature_names_out.extend(representation.feature_names_out)
 
         rul_config = self.config.get('rul_regression', {})
         regressor = None
@@ -1680,6 +1914,9 @@ class ANSRDTPipeline:
                 regressor is not None
                 and rul_report.get('used_as_classifier_feature', False)
             ),
+            'representation': representation,
+            'representation_report': representation_report,
+            'uses_representation': use_representation,
         }
 
     @staticmethod
@@ -1773,6 +2010,10 @@ class ANSRDTPipeline:
         )
         if not comparison_config.get('enabled', False):
             return {}
+        comparison_config = dict(comparison_config)
+        comparison_config['alert_budget'] = dict(
+            self.config.get('alert_budget', {}) or {}
+        )
         report = build_alert_policy_comparison(
             splits['y_val'], val_scores, splits['val_units'],
             splits['val_cycles'], splits['val_rul'],
@@ -1800,18 +2041,50 @@ class ANSRDTPipeline:
         }
 
     def transform_external_windows(self, prepared: Dict[str, Any],
-                                   X_raw: np.ndarray) -> np.ndarray:
-        """Apply the source-fitted transforms to external target windows."""
+                                   X_raw: np.ndarray,
+                                   units: Optional[np.ndarray] = None,
+                                   cycles: Optional[np.ndarray] = None,
+                                   op_settings: Optional[np.ndarray] = None
+                                   ) -> np.ndarray:
+        """Apply the source-fitted transforms to external target windows.
+
+        The representation artifact is always the source-fitted one. Target
+        units/cycles/settings are used only to locate each target window's
+        condition or early-life baseline; they never refit the representation
+        or its thresholds.
+        """
         data = np.asarray(X_raw, dtype=np.float32)
         architecture = prepared['architecture']
+        representation = prepared.get('representation')
+        representation_matrix = None
+        if prepared.get('uses_representation') and representation is not None:
+            representation_matrix = representation.transform(
+                data, units=units, cycles=cycles, op_settings=op_settings
+            )
         if prepared.get('uses_temporal_features') and prepared['extractor']:
             transformed = prepared['extractor'].transform(data)
+            if representation_matrix is not None:
+                transformed = np.hstack([
+                    transformed, representation_matrix
+                ]).astype(np.float32)
         elif architecture == 'lightgbm':
             transformed = np.asarray(data).reshape(len(data), -1)
+            if representation_matrix is not None:
+                transformed = np.hstack([
+                    transformed, representation_matrix
+                ]).astype(np.float32)
         elif prepared.get('scaler') is not None:
-            transformed = self._split_scaled(prepared['scaler'], data)
+            if representation_matrix is not None:
+                transformed = prepared['scaler'].transform(
+                    representation_matrix
+                )
+            else:
+                transformed = self._split_scaled(prepared['scaler'], data)
         else:
-            transformed = data
+            transformed = (
+                representation_matrix if representation_matrix is not None
+                else data
+            )
         if (prepared.get('uses_rul_feature')
                 and prepared.get('rul_regressor') is not None):
             predicted_rul = prepared['rul_regressor'].predict(transformed)
@@ -1829,7 +2102,10 @@ class ANSRDTPipeline:
         The threshold and every transform come from the source run. Target
         labels are used only to report metrics, never to fit or select.
         """
-        X_model = self.transform_external_windows(prepared, X_raw)
+        X_model = self.transform_external_windows(
+            prepared, X_raw, units=units, cycles=cycles,
+            op_settings=getattr(self, '_external_op_settings', None),
+        )
         return self.evaluate_external_model_input(
             prepared, X_model, y_true, units, cycles, rul, threshold,
         )
@@ -1978,6 +2254,15 @@ class ANSRDTPipeline:
             'episode_metrics': episode_metrics,
             'alerting': alerting,
             'rul_regression': prepared['rul_report'],
+            'representation': prepared.get('representation_report', {}),
+            'representation_path': (
+                prepared['paths']['representation']
+                if prepared.get('uses_representation') else None
+            ),
+            'representation_metadata_path': (
+                prepared['paths']['representation_metadata']
+                if prepared.get('uses_representation') else None
+            ),
             'feature_metadata_path': (
                 prepared['paths']['feature_metadata']
                 if prepared['uses_temporal_features'] else None
@@ -2246,6 +2531,10 @@ class ANSRDTPipeline:
             model_path=evaluation.get('model_path'),
             scaler_path=scaler_path if os.path.exists(scaler_path) else None,
             feature_metadata_path=evaluation.get('feature_metadata_path'),
+            representation_path=evaluation.get('representation_path'),
+            representation_metadata_path=evaluation.get(
+                'representation_metadata_path'
+            ),
             rules_path=rules_path,
             learned_rules_path=learned_rules_path,
             problog_rules_path=PROB_RULES_PATH,
@@ -2480,6 +2769,7 @@ class ANSRDTPipeline:
             'threshold_sensitivity': {},
             'fusion_diagnostics': {},
             'fusion_nested_validation': {},
+            'cost_sensitivity': {},
             'drift': {},
             'audit': {},
         }
@@ -2513,6 +2803,31 @@ class ANSRDTPipeline:
                 "Operational policy: %s selected on validation "
                 "(expected cost %.2f).", alert_mode,
                 policy_report['validation'][alert_mode]['expected_cost'],
+            )
+
+        cost_config = self.config.get('cost_sensitivity', {})
+        if cost_config.get('enabled', False):
+            cost_report = build_cost_sensitivity(
+                splits['y_val'], val_scores, splits['val_units'],
+                splits['val_cycles'], splits['val_rul'],
+                splits['y_test'], test_scores, splits['test_units'],
+                splits['test_cycles'], splits['test_rul'],
+                decision_threshold, cost_config,
+            )
+            cost_paths = save_cost_sensitivity(cost_report, results_dir)
+            analyses['cost_sensitivity'] = {
+                'enabled': True,
+                **cost_paths,
+                'selection_split': 'validation',
+                'ratios': [row['ratio'] for row in cost_report['rows']],
+                'selected_modes': {
+                    row['ratio']: row['selected_mode']
+                    for row in cost_report['rows']
+                },
+            }
+            self.logger.info(
+                "Cost sensitivity written to %s.",
+                cost_paths['csv_path'],
             )
 
         sensitivity_config = self.config.get('threshold_sensitivity', {})
@@ -2896,6 +3211,7 @@ class ANSRDTPipeline:
             'decision_threshold': decision_section,
             'probability_fusion': fusion_report,
             'rul_regression': rul_report,
+            'representation': prepared.get('representation_report', {}),
             'alerting': alerting,
             'alert_policy_comparison': alert_policy,
             'calibration': {
@@ -2914,6 +3230,7 @@ class ANSRDTPipeline:
             'fusion_nested_validation': analyses[
                 'fusion_nested_validation'
             ],
+            'cost_sensitivity': analyses['cost_sensitivity'],
             'drift': analyses['drift'],
             'audit': analyses['audit'],
             'artifacts': {
@@ -2930,6 +3247,14 @@ class ANSRDTPipeline:
                 'rul_regressor_path': (
                     prepared['paths']['rul_regressor']
                     if prepared['rul_report'].get('applied') else None
+                ),
+                'representation_path': (
+                    prepared['paths']['representation']
+                    if prepared.get('uses_representation') else None
+                ),
+                'representation_metadata_path': (
+                    prepared['paths']['representation_metadata']
+                    if prepared.get('uses_representation') else None
                 ),
                 'fusion_model_path': fusion.get('model_path'),
                 'problog_rules_path': PROB_RULES_PATH,
@@ -2960,6 +3285,15 @@ class ANSRDTPipeline:
                 'fusion_nested_validation_path': analyses[
                     'fusion_nested_validation'
                 ].get('path'),
+                'cost_sensitivity_json_path': analyses[
+                    'cost_sensitivity'
+                ].get('json_path'),
+                'cost_sensitivity_csv_path': analyses[
+                    'cost_sensitivity'
+                ].get('csv_path'),
+                'cost_sensitivity_plot_path': analyses[
+                    'cost_sensitivity'
+                ].get('plot_path'),
                 'episode_metrics_validation_path': episode_metrics[
                     'validation'
                 ].get('csv_path'),

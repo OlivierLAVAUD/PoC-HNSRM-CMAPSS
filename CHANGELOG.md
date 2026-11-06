@@ -4,6 +4,59 @@ All notable changes to `poc-hnsrm-cmapss` are documented here. The project is a
 research proof of concept; entries describe evaluation-protocol changes rather
 than production releases.
 
+## [1.9.0] - 2026-11-06
+
+### Added
+
+- **Persisted physical representation.** `src/features/physical_representation.py`
+  implements `raw`, `deltas`, `early_life_residual`,
+  `operating_condition_residual` and `residual_plus_deltas`, with configurable
+  early-life length, neutral/error fallback, training hash and joblib/JSON
+  artifacts. RandomForest applies it before the scaler, LightGBM appends it to
+  temporal features, and inference reloads the artifact.
+- **Representation ablation.** `python main.py --representation-ablation` writes
+  `results/representation_ablation/summary.{json,csv}` and plots, with an
+  automatic non-causal conclusion.
+- **Alert budget.** Validation-only `max_alerts_per_engine` and
+  `max_alerts_per_100_cycles` selection, integrated into alert-policy
+  comparison without a new alert mode.
+- **Few-shot target adaptation.** `python main.py --few-shot-target fd003`
+  splits target training engines into calibration/validation, recalibrates,
+  selects the threshold on target validation and evaluates the official target
+  test once. It is explicitly **not zero-shot**. FD002 and FD004 are also
+  available via `--few-shot-target fd002|fd004`.
+- **Repeated few-shot split selection.** `selection_repeats` and
+  `threshold_aggregation` repeat the target calibration/validation split and
+  freeze the median validation-selected threshold (5 splits in the shipped
+  config). `threshold_report.json` records every threshold, dispersion,
+  strategy counts and the representative split. This made the frozen
+  thresholds much less partition-dependent but did not fix FD002/FD004
+  ranking: test F1 remains 0.079/0.050, so the audit still flags prevalence
+  shift and validation optimism. FD004 keeps within-validation bootstrap
+  instability (`std 0.207`).
+- **Prevalence-controlled few-shot validation.** `validation_positive_rate`
+  downsamples the majority class on target validation only, preserving test
+  labels. Raw and balanced validation metrics are both reported. At 10%,
+  FD002/FD004 test F1 improved only from 0.079/0.050 to 0.093/0.060, with
+  precision still 4.9%/3.1%; FD003 stayed at F1 0.499 and its repeat threshold
+  std rose to 0.226. This is a diagnostic, not a ranking fix.
+- **Few-shot robustness audit.** `robustness_audit.json` compares validation
+  and test distributions, bootstraps threshold selection by validation engine
+  and runs leave-one-engine-out selection. A validation-only guard replaces a
+  threshold that collapses recall with an `fbeta` threshold and records the
+  fallback. Real FD002/FD004 runs show prevalence shift, validation optimism
+  and unstable thresholds; the guard restores alerts but not precision.
+- **Cost sensitivity.** `results/cost_sensitivity.{json,csv}` and a plot for
+  false-negative/false-alarm cost ratios.
+
+### Tests
+
+- Representation variants, short-trajectory fallback, persistence/hash,
+  operating-condition residuals and pipeline integration.
+- Alert-budget selection, unreachable budget, cost sensitivity, few-shot
+  engine isolation/calibration/threshold, repeated-split median aggregation,
+  validation prevalence downsampling and CLI flags.
+
 ## [1.8.0] - 2026-11-06
 
 ### Added

@@ -201,6 +201,15 @@ python main.py --cross-condition --cross-test-datasets fd002,fd004
 python main.py --cross-condition --cross-test-datasets fd002,fd003,fd004 \
   --cross-normalization per_condition --cross-threshold target_alert_rate
 
+# Physical-representation ablation on FD001 -> FD002/FD003/FD004
+python main.py --representation-ablation
+
+# Few-shot target adaptation (not zero-shot)
+python main.py --few-shot-target fd003
+
+# Cost-ratio sensitivity for the alert policies
+python main.py --operational-policy
+
 # Consolidate every robustness artifact into one dossier
 python main.py --robustness-report
 
@@ -473,6 +482,76 @@ The result is a **negative result for simple label-free adaptation**, and is rep
 - Combining both corrections is worse than threshold matching alone on FD002/FD004. There is no universal operating point across conditions.
 
 The ranking itself is near chance on FD002/FD004 (ROC-AUC around `0.55-0.60`, average precision `0.03-0.06`). The next step is therefore not another threshold rule but a condition-aware representation (health index, condition-specific model or a small labelled target calibration set), evaluated with the same ablation.
+
+## Representation ablation
+
+`python main.py --representation-ablation` trains one source model per variant on FD001 only, calibrates on FD001 training windows, selects the threshold on FD001 validation engines, and then applies the frozen threshold to the official test engines of FD001-FD004. Target labels compute metrics only.
+
+The five variants are:
+
+| Variant | Content |
+|---|---|
+| `raw` | Flattened raw window; control condition. |
+| `deltas` | 5/10/30-cycle deltas, robust slope, standard deviation, persistence and relative variation. |
+| `early_life_residual` | Per-engine median/MAD residual against the first `N` cycles (`N` configurable, default 20), plus `early_life_available`. |
+| `operating_condition_residual` | Per-regime median/MAD fitted on source training windows, plus `condition_available`. |
+| `residual_plus_deltas` | Residual representation concatenated with the delta features. |
+
+`representation.enabled: false` keeps the previous behaviour exactly. When enabled, RandomForest applies the representation **before** `StandardScaler`; LightGBM **appends** it to the existing temporal features; CNN-LSTM keeps raw 3D windows and does not apply it by default. The fitted artifact stores the baseline statistics, parameters, sensor list and training-data hash, and inference reloads it to reconstruct the same features.
+
+Outputs are isolated in `results/representation_ablation/summary.csv`, `summary.json` and `plots/*.png`. The automatic conclusion reports whether FD002/FD004 remain below ROC-AUC `0.65` / AP `0.10`, and whether FD003 shows a high ROC-AUC with low source-threshold recall (a threshold/calibration problem). It makes no causal claim.
+
+## Alert budget
+
+A fixed threshold, a copied source alert rate and an alert budget are different things:
+
+- a **fixed threshold** applies one probability cutoff everywhere;
+- a **source alert rate** copies the fraction of positive windows seen on the source validation split;
+- an **alert budget** is an operational capacity constraint, for example at most one alert per engine or 5 alerts per 100 cycles. The highest validation threshold satisfying the constraint is selected, then frozen for test. If no observed threshold satisfies it, `unreachable_policy` either raises a clear error or returns the most constraining threshold with `feasible: false`.
+
+```yaml
+alert_budget:
+  enabled: true
+  max_alerts_per_engine: 1.0
+  max_alerts_per_100_cycles: null
+  selection_split: "validation"
+  unreachable_policy: "error"
+```
+
+The budget is integrated into `alert_policy_comparison` as a threshold variant; it does not add a sixth alert mode.
+
+## Few-shot target adaptation
+
+`python main.py --few-shot-target fd003` is **not zero-shot**. It loads the published FD001 artifacts without modifying them, splits FD003 *training* engines into disjoint calibration and validation subsets, repeats that split `selection_repeats` times (5 in the shipped config), optionally recalibrates on each calibration subset, selects a threshold on each target validation subset, freezes the **median** of those thresholds, and only then evaluates the official FD003 test engines once. `threshold_aggregation: single` restores one-split selection.
+
+Outputs: `results/few_shot_target/<target>/report.json`, `summary.csv`, `calibration_report.json`, `threshold_report.json` and `robustness_audit.json`. The report carries `protocol: "few_shot_target_adaptation"`, `threshold_selection` with every repeated split, and an explicit warning that target training engines were used for calibration. Target test engines never participate in calibration or selection.
+
+`validation_positive_rate: 0.10` is a fixed operating assumption for validation composition, not a prevalence estimated from the official test labels. When set, the majority class is downsampled without replacement on each target-validation split; the report keeps both the raw and balanced validation metrics (`validation_unbalanced`) and records the windows/positive counts. `null` disables the control.
+
+The robustness audit compares target validation and target test score/prevalence distributions, bootstraps threshold selection over validation engines (200 draws) and runs leave-one-engine-out threshold selection. It never selects on test. A validation-only guard also rejects a selected threshold whose recall collapses (for example the `recall_at_precision` solution sitting on a tiny high-score island); it retries with `fbeta` and records `threshold_guard_fallback`.
+
+Real runs on the current artifacts with five repeated splits and validation prevalence controlled at 10%:
+
+| Target | Requested strategy | Frozen threshold | Repeat threshold std | Validation F1 | Raw validation F1 | Test F1 | Test ROC-AUC | Test recall | Audit flags |
+|---|---|---:|---:|---:|---:|---:|---:|---:|---|
+| FD002 | recall_at_precision -> fbeta guard | 0.1517 | 0.016 | 0.205 | 0.320 | 0.093 | 0.603 | 0.752 | prevalence shift, within-validation bootstrap instability |
+| FD003 | recall_at_precision | 0.4227 | 0.226 | 0.754 | 0.785 | 0.499 | 0.947 | 0.395 | F1 gap, prevalence/score shift, bootstrap instability, low recall |
+| FD004 | recall_at_precision -> fbeta guard | 0.1340 | 0.016 | 0.210 | 0.279 | 0.060 | 0.627 | 0.780 | prevalence shift, within-validation bootstrap instability |
+
+Balancing validation to 10% lowers the raw positive rates from 17.4%/13.9%/14.4% and raises the thresholds, which improves FD002/FD004 test F1 only modestly: **0.079 -> 0.093** and **0.050 -> 0.060**. Precision remains **4.9% / 3.1%**, so the alerts are still mostly false. FD003's test result is unchanged (F1 0.499, recall 0.395), but its repeat threshold std rises to **0.226**: the `recall_at_precision` choice reacts strongly to positive-window resampling. FD002/FD004 also keep within-validation bootstrap threshold std of **0.219 / 0.207**. Prevalence control is therefore a useful diagnostic, not a fix for ranking. These are descriptive results, not a new zero-shot claim.
+
+## Cost sensitivity
+
+`cost_sensitivity` replays ratios of false-negative to false-alarm cost on validation, selects the best alert mode for each ratio there, and reports the frozen choice on test. Ratios are assumptions, not tuned test parameters. Outputs: `results/cost_sensitivity.json`, `results/cost_sensitivity.csv` and `results/visualization/cost_sensitivity.png`.
+
+| Artifact | Content |
+|---|---|
+| `results/representation_ablation/summary.{json,csv}` | Five variants x four datasets x two threshold strategies. |
+| `results/representation_ablation/plots/*.png` | ROC-AUC and average-precision comparisons. |
+| `results/few_shot_target/fd003/*` | Few-shot report, calibration and threshold diagnostics. |
+| `results/cost_sensitivity.{json,csv}` | Cost-ratio sensitivity and selected alert modes. |
+| `results/models/physical_representation*.joblib` | Persisted representation artifact. |
+| `results/physical_representation*.json` | Parameters, sensors and training hash. |
 
 ### Symbolic contribution
 

@@ -69,6 +69,8 @@ def build_artifact_versions(
         model_path: Optional[str] = None,
         scaler_path: Optional[str] = None,
         feature_metadata_path: Optional[str] = None,
+        representation_path: Optional[str] = None,
+        representation_metadata_path: Optional[str] = None,
         rules_path: Optional[str] = None,
         learned_rules_path: Optional[str] = None,
         problog_rules_path: Optional[str] = None) -> Dict[str, Any]:
@@ -77,6 +79,10 @@ def build_artifact_versions(
         'model_sha256': sha256_file(model_path),
         'scaler_sha256': sha256_file(scaler_path),
         'feature_metadata_sha256': sha256_file(feature_metadata_path),
+        'representation_sha256': sha256_file(representation_path),
+        'representation_metadata_sha256': sha256_file(
+            representation_metadata_path
+        ),
         'rules_pl_sha256': sha256_file(rules_path),
         'rules_learned_pl_sha256': sha256_file(learned_rules_path),
         'problog_rules_sha256': sha256_file(problog_rules_path),
@@ -96,6 +102,8 @@ def build_artifact_versions(
             'model': model_path,
             'scaler': scaler_path,
             'feature_metadata': feature_metadata_path,
+            'representation': representation_path,
+            'representation_metadata': representation_metadata_path,
             'rules': rules_path,
             'learned_rules': learned_rules_path,
             'problog_rules': problog_rules_path,

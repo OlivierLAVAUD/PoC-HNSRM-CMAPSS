@@ -188,6 +188,11 @@ def build_parser() -> argparse.ArgumentParser:
                         help='Select the alert mode from maintenance costs.')
     parser.add_argument('--robustness-report', action='store_true',
                         help='Build a robustness dossier from existing artifacts.')
+    parser.add_argument('--representation-ablation', action='store_true',
+                        help='Run the controlled physical-representation ablation.')
+    parser.add_argument('--few-shot-target', default=None,
+                        choices=['fd002', 'fd003', 'fd004'],
+                        help='Run few-shot target adaptation (not zero-shot).')
     parser.add_argument(
         '--cmapss-dataset',
         choices=list(CMAPSS_DATASETS),
@@ -233,7 +238,8 @@ def main(clear: bool = False, compare_models: bool = False,
          seeds: str = None, threshold_sensitivity: bool = False,
          operational_policy: bool = False, benchmark: str = 'fd001',
          cmapss_dataset: str = 'fd001', cross_condition: bool = False,
-         robustness_report: bool = False,
+         robustness_report: bool = False, representation_ablation: bool = False,
+         few_shot_target: str = None,
          cross_train_dataset: str = None, cross_test_datasets: str = None,
          cross_normalization: str = None, cross_threshold: str = None,
          modes=None, data_path: str = None,
@@ -309,6 +315,72 @@ def main(clear: bool = False, compare_models: bool = False,
         report = run_robustness_report(results_dir)
         _print_robustness_summary(report)
         logger.info("--- ANSR-DT robustness report finished ---")
+        return 0
+
+    if representation_ablation:
+        from src.experiments.representation_ablation import (
+            run_representation_ablation,
+        )
+
+        ablation_config_path = _config_path_for_dataset(PROJECT_ROOT, 'fd001')
+        ablation_config = load_config(ablation_config_path)
+        targets = []
+        for name in ('fd002', 'fd003', 'fd004'):
+            target_path = _config_path_for_dataset(PROJECT_ROOT, name)
+            targets.append({
+                'name': name.upper(),
+                'config': load_config(target_path),
+                'config_path': target_path,
+            })
+        report = run_representation_ablation(
+            ablation_config, ablation_config_path, targets, logger,
+            results_dir=os.path.join(
+                results_dir, 'representation_ablation'
+            ),
+            architecture=architecture,
+        )
+        print("\n=== Representation ablation ===")
+        for statement in report['conclusion']['statements']:
+            print(f"  {statement}")
+        print(f"  summary: {report['artifacts']['summary_json']}")
+        print(f"  csv:     {report['artifacts']['summary_csv']}")
+        logger.info("--- Representation ablation finished ---")
+        return 0
+
+    if few_shot_target:
+        from src.experiments.few_shot import run_few_shot_target
+
+        source_path = _config_path_for_dataset(PROJECT_ROOT, 'fd001')
+        source_config = load_config(source_path)
+        target_name = few_shot_target.lower()
+        target_path = _config_path_for_dataset(PROJECT_ROOT, target_name)
+        target_config = load_config(target_path)
+        target_config['few_shot_target'] = {
+            **(target_config.get('few_shot_target', {}) or {}),
+            **((config.get('few_shot_target', {}) or {})),
+            'enabled': True,
+            'target_dataset': target_name,
+        }
+        report = run_few_shot_target(
+            source_config, target_config, target_path, logger,
+            results_dir=os.path.join(
+                results_dir, 'few_shot_target', target_name
+            ),
+            architecture=architecture,
+        )
+        print("\n=== Few-shot target adaptation ===")
+        print(
+            f"source=FD001 target={target_name.upper()} "
+            f"protocol={report['protocol']}"
+        )
+        print(
+            f"threshold={report['threshold']:.4f} "
+            f"test_f1={float(report['metrics'].get('f1') or 0):.4f} "
+            f"test_recall={float(report['metrics'].get('recall') or 0):.4f}"
+        )
+        print(f"  warning: {report['warning']}")
+        print(f"  report: {report['artifacts']['report_path']}")
+        logger.info("--- Few-shot target adaptation finished ---")
         return 0
 
     if cross_condition:
@@ -411,6 +483,8 @@ if __name__ == '__main__':
         cross_normalization=args.cross_normalization,
         cross_threshold=args.cross_threshold,
         robustness_report=args.robustness_report,
+        representation_ablation=args.representation_ablation,
+        few_shot_target=args.few_shot_target,
         modes=args.modes,
         data_path=args.data_path,
         model_type=args.model_type,

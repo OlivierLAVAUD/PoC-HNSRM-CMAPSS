@@ -193,6 +193,66 @@ features:
     apply_to_architectures: ["lightgbm"]
 
 # ===============================
+# Physical Representation Ablation
+# ===============================
+# Disabled by default: the historical flattened-window behaviour is preserved.
+# Selection and fitting use training windows only; the official test split is
+# reporting-only. See README.md for the five variants.
+representation:
+  enabled: false
+  variant: "raw"  # raw | deltas | early_life_residual | operating_condition_residual | residual_plus_deltas
+  early_life_cycles: 20
+  epsilon: 1.0e-6
+  fallback_policy: "neutral"  # neutral | error
+  include_raw_features: true
+  n_conditions: null          # defaults to dataset.operating_conditions
+  apply_to_architectures: ["random_forest", "lightgbm"]
+
+# ===============================
+# Alert Budget
+# ===============================
+# A budget is an operational constraint selected on validation, distinct from
+# copying the source alert rate. The frozen threshold is applied to test.
+alert_budget:
+  enabled: false
+  max_alerts_per_engine: null
+  max_alerts_per_100_cycles: null
+  selection_split: "validation"
+  unreachable_policy: "error"  # error | most_constraining
+
+# ===============================
+# Few-shot Target Adaptation
+# ===============================
+# This is NOT a zero-shot protocol: target training engines are split into
+# calibration and validation; the official target test engines stay intact.
+few_shot_target:
+  enabled: false
+  target_dataset: "fd003"
+  calibration_fraction: 0.5
+  validation_fraction: 0.5
+  random_state: 42
+  recalibrate: true
+  recalibration_method: "auto"  # auto | sigmoid | isotonic
+  threshold_strategy: "recall_at_precision"
+  min_precision: 0.75
+  # Repeat the target engine split; the frozen threshold is the median of the
+  # validation-selected thresholds. The official test split is never used.
+  selection_repeats: 5
+  threshold_aggregation: "median"  # median | single
+  # Predeclared operating assumption for validation composition; it is not
+  # estimated from the official test labels. null disables prevalence control.
+  validation_positive_rate: 0.10
+
+# ===============================
+# Cost Sensitivity
+# ===============================
+cost_sensitivity:
+  enabled: false
+  false_negative_cost_ratios: [1, 5, 10, 25, 50, 100]
+  false_alarm_cost: 1.0
+  selection_split: "validation"
+
+# ===============================
 # Controlled Model Comparison
 # ===============================
 experiments:

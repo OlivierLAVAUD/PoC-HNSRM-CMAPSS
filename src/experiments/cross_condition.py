@@ -380,7 +380,8 @@ def run_cross_condition(
         X_target = source._sanitize_non_finite(X_target, f'cross-{name}')
 
         baseline_input = source.transform_external_windows(
-            prepared, X_target
+            prepared, X_target, units=units, cycles=cycles,
+            op_settings=op_settings,
         )
         baseline_eval = source.evaluate_external_model_input(
             prepared, baseline_input, y_target, units, cycles, rul, threshold,

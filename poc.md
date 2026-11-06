@@ -241,6 +241,12 @@ python main.py --cross-condition --cross-test-datasets fd002,fd004
 python main.py --cross-condition --cross-test-datasets fd002,fd003,fd004 \
   --cross-normalization per_condition --cross-threshold target_alert_rate
 
+# Physical-representation ablation (five variants, FD001 source)
+python main.py --representation-ablation
+
+# Few-shot target adaptation: target training engines only, NOT zero-shot
+python main.py --few-shot-target fd003
+
 # Consolidated robustness dossier from the artifacts in results/
 python main.py --robustness-report
 ```
@@ -257,6 +263,27 @@ python main.py --benchmark skab --modes random_forest
 # Symbolic only on SKAB
 python main.py --benchmark skab --modes symbolic
 ```
+
+### Representation and adaptation protocols
+
+- **Representation ablation**: `raw`, `deltas`, `early_life_residual`,
+  `operating_condition_residual` and `residual_plus_deltas` are trained on
+  FD001 only and evaluated on FD001-FD004 with the source or alert-budget
+  threshold. Results are isolated in `results/representation_ablation/`.
+- **Alert budget**: a validation-selected capacity constraint (alerts per
+  engine or per 100 cycles), distinct from a fixed threshold or a copied
+  source alert rate.
+- **Few-shot target adaptation**: uses target *training* engines split into
+  calibration and validation, repeats the split, optionally downsamples
+  validation to a predeclared positive rate, and freezes the median validation
+  threshold before evaluating the official target test once. It is explicitly
+  **not a zero-shot** protocol. Each run also writes `robustness_audit.json`:
+  validation/test score and prevalence comparison, engine-bootstrap threshold
+  stability, leave-one-engine-out selection and a validation-only guard
+  against thresholds that collapse recall.
+- **Cost sensitivity**: validation-only replay of false-negative/false-alarm
+  cost ratios; artifacts are `results/cost_sensitivity.{json,csv}` and
+  `results/visualization/cost_sensitivity.png`.
 
 ### Expected Output Quality
 

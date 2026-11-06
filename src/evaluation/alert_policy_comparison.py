@@ -18,6 +18,7 @@ from typing import Any, Dict, Iterable, Optional
 
 import numpy as np
 
+from src.evaluation.alert_budget import select_alert_budget_threshold
 from src.evaluation.alerting import (
     hysteresis_predictions,
     resolve_hysteresis_thresholds,
@@ -208,6 +209,40 @@ def build_alert_policy_comparison(
     _with_deltas(validation, cost_unit)
     _with_deltas(test, cost_unit)
 
+    alert_budget = {}
+    budget_config = config.get('alert_budget') or {}
+    if budget_config.get('enabled', False):
+        budget_selection = select_alert_budget_threshold(
+            val_scores, val_units, val_cycles, budget_config
+        )
+        budget_threshold = float(budget_selection['threshold'])
+        budget_validation, _ = _evaluate_modes(
+            y_val, val_scores, val_units, val_cycles, val_rul,
+            budget_threshold, modes, fn_cost, fa_cost, cost_unit, capacity,
+            hysteresis_config,
+        )
+        budget_test, _ = _evaluate_modes(
+            y_test, test_scores, test_units, test_cycles, test_rul,
+            budget_threshold, modes, fn_cost, fa_cost, cost_unit, capacity,
+            hysteresis_config,
+        )
+        budget_selected = max(
+            budget_validation,
+            key=lambda mode: _selection_key(
+                budget_validation[mode], metric, beta, cost_unit
+            ),
+        )
+        alert_budget = {
+            'enabled': True,
+            'selection_split': 'validation',
+            'test_usage': 'reporting_only',
+            'threshold': budget_threshold,
+            'selection': budget_selection,
+            'selected_mode': budget_selected,
+            'validation': budget_validation,
+            'test': budget_test,
+        }
+
     chosen = validation[selected]
     immediate = validation['immediate']
     return {
@@ -226,6 +261,7 @@ def build_alert_policy_comparison(
         'selection_reason': selection_reason,
         'validation': validation,
         'test': test,
+        'alert_budget': alert_budget,
         'rationale': {
             'selected_mode': selected,
             'cost_unit': cost_unit,
